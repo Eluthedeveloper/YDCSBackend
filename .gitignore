@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment variables
+.env
+.env.example
+
+# Logs
+*.log
+
+# Media uploads (large, not for version control)
+uploads/
+
+# Local database artifacts (code uses MySQL)
+database.sqlite
+
+# Archives / backups
+*.zip
+*.tar.gz
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
