@@ -27,9 +27,13 @@ async function start() {
     const app = express();
     const PORT = Number(process.env.PORT) || 5000;
 
-    // Trust one reverse proxy hop (Apache/nginx/caddy) so rate limits and
-    // req.ip are based on the real client IP instead of the proxy IP.
-    app.set('trust proxy', 1);
+    // Trust one reverse proxy hop (Apache/nginx/caddy) only when explicitly
+    // configured, so rate limits and req.ip are based on the real client IP.
+    // If the server is directly reachable, keep this off: otherwise clients
+    // can spoof X-Forwarded-For to bypass every rate limiter.
+    if (process.env.TRUST_PROXY === 'true') {
+      app.set('trust proxy', 1);
+    }
 
     // Security
     app.use(
@@ -114,29 +118,41 @@ async function start() {
         }
         const fileSize = stat.size;
         const range = req.headers.range;
-        if (range && isAudio) {
-          const parts = range.replace(/bytes=/, '').split('-');
-          const start = parseInt(parts[0], 10);
-          const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-          const chunkSize = end - start + 1;
-          const file = fsSync.createReadStream(filePath, { start, end });
-          res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': chunkSize,
-            'Content-Type': contentType,
-            'Cache-Control': 'public, max-age=31536000',
-          });
-          file.pipe(res);
-        } else {
-          res.writeHead(200, {
+
+        if (!range) {
+          return res.writeHead(200, {
             'Content-Length': fileSize,
             'Content-Type': contentType,
             'Accept-Ranges': isAudio ? 'bytes' : 'none',
             'Cache-Control': 'public, max-age=31536000',
-          });
-          fsSync.createReadStream(filePath).pipe(res);
+          }).end();
         }
+
+        const unsatisfiable = () =>
+          res.status(416).set('Content-Range', `bytes */${fileSize}`).json({ error: 'Range not satisfiable' });
+
+        const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+        if (!match) return unsatisfiable();
+
+        const start = match[1] ? parseInt(match[1], 10) : 0;
+        let end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+
+        if (Number.isNaN(start) || Number.isNaN(end) || start < 0 || end < start || start >= fileSize) {
+          return unsatisfiable();
+        }
+
+        end = Math.min(end, fileSize - 1);
+        const chunkSize = end - start + 1;
+        const file = fsSync.createReadStream(filePath, { start, end });
+        file.on('error', () => res.destroy());
+        res.writeHead(206, {
+          'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': chunkSize,
+          'Content-Type': contentType,
+          'Cache-Control': 'public, max-age=31536000',
+        });
+        file.pipe(res);
       });
     });
 

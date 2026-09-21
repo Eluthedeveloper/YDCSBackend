@@ -2,8 +2,18 @@ import { Router, Response } from 'express';
 import nodemailer from 'nodemailer';
 import path from 'path';
 import fs from 'fs';
+import rateLimit from 'express-rate-limit';
 
 const router = Router();
+
+// Dedicated limiter so the contact form can't be used to spam the SMTP inbox.
+const contactLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many messages, please try again later.' },
+});
 
 // Logo lives at asset/Logo.png relative to the project root.
 // Sent as a CID inline attachment so it renders reliably across email clients.
@@ -109,7 +119,7 @@ function infoRow(label: string, value: string): string {
     </tr>`;
 }
 
-router.post('/', async (req, res: Response) => {
+router.post('/', contactLimiter, async (req, res: Response) => {
   const { name, email, phone, subject, message, lang } = req.body;
 
   if (!name || !email || !subject || !message) {

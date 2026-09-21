@@ -112,7 +112,8 @@ router.get('/search', async (req, res: Response) => {
       return res.json({ programs: [], tracks: [] });
     }
 
-    const cacheKey = `public:search:${q.toLowerCase().trim()}`;
+    // Cap the key so attackers can't use arbitrary query strings to fill Redis.
+    const cacheKey = `public:search:${q.toLowerCase().trim().slice(0, 100)}`;
     const cached = await cacheGet(cacheKey);
     if (cached) return res.json(cached);
 
@@ -232,7 +233,9 @@ router.post('/tracks/:id/listen', interactionLimiter, async (req, res: Response)
     await runSQL('INSERT INTO listens (id, track_id, program_id, fingerprint) VALUES (?, ?, ?, ?)',
       [id, track.id, track.program_id, fingerprint || null]);
 
-    await cacheInvalidate('public:*');
+    // No cache invalidate here: a listen never changes any cached program/track
+    // payload, and flushing the whole cache on every play would defeat caching
+    // under streaming load. The listens stats key self-expires in 60s.
     res.json({ success: true });
   } catch (err) {
     console.error('Error recording listen:', err);

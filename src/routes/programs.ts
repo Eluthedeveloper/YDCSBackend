@@ -80,9 +80,13 @@ router.get('/:id', authenticate, requireAdmin, async (req, res: Response) => {
 });
 
 router.post('/', authenticate, requireAdmin, uploadCover.single('cover_image'), sanitizeBody, async (req: AuthRequest, res: Response) => {
+  const cleanupCover = () => {
+    if (req.file) fs.unlink(path.join('uploads', 'covers', req.file.filename)).catch(() => {});
+  };
   try {
     const { title, description } = req.body;
     if (!title || !title.trim()) {
+      cleanupCover();
       return res.status(400).json({ error: 'Title is required' });
     }
 
@@ -95,6 +99,7 @@ router.post('/', authenticate, requireAdmin, uploadCover.single('cover_image'), 
     await cacheInvalidate('public:*');
     res.json({ id, title: title.trim(), description, cover_image, created_by: req.user!.id });
   } catch (err) {
+    cleanupCover();
     console.error('Error creating program:', err);
     res.status(500).json({ error: 'Failed to create program' });
   }
@@ -112,8 +117,18 @@ router.put('/:id', authenticate, requireAdmin, uploadCover.single('cover_image')
     const { title, description } = req.body;
     const cover_image = req.file ? req.file.filename : program.cover_image;
 
+    // Description can be cleared by sending an empty string; absent fields
+    // keep their current value.
+    const updatedTitle = title !== undefined && title.trim() ? title.trim() : program.title;
+    const updatedDescription = description !== undefined ? description : program.description;
+
     await runSQL('UPDATE programs SET title = ?, description = ?, cover_image = ? WHERE id = ?',
-      [title || program.title, description || program.description, cover_image, req.params.id]);
+      [updatedTitle, updatedDescription, cover_image, req.params.id]);
+
+    // Remove the replaced cover file so old images don't accumulate.
+    if (req.file && program.cover_image && program.cover_image !== cover_image) {
+      fs.unlink(path.join('uploads', 'covers', program.cover_image)).catch(() => {});
+    }
 
     await cacheInvalidate('public:*');
     res.json({ message: 'Program updated' });

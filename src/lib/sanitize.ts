@@ -16,14 +16,15 @@ export function sanitize(obj: any): any {
       });
   }
 
-  if (Array.isArray(obj)) {
-    return obj.map(sanitize);
-  }
-
   if (obj && typeof obj === 'object') {
+    // Passwords must never be HTML-escaped, otherwise credentials containing
+    // chars like & < " get silently corrupted before hashing.
+    if (Array.isArray(obj)) {
+      return obj.map(sanitize);
+    }
     const clean: any = {};
     for (const key of Object.keys(obj)) {
-      clean[key] = sanitize(obj[key]);
+      clean[key] = key.toLowerCase() === 'password' ? obj[key] : sanitize(obj[key]);
     }
     return clean;
   }

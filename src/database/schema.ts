@@ -113,7 +113,6 @@ export async function initDB(): Promise<mysql.Pool> {
     { sql: 'CREATE INDEX idx_comments_created ON comments(created_at DESC)', name: 'idx_comments_created' },
     { sql: 'CREATE INDEX idx_likes_track ON likes(track_id)', name: 'idx_likes_track' },
     { sql: 'CREATE INDEX idx_likes_fingerprint ON likes(fingerprint)', name: 'idx_likes_fingerprint' },
-    { sql: 'CREATE INDEX idx_users_username ON users(username)', name: 'idx_users_username' },
     { sql: 'CREATE INDEX idx_users_role ON users(role)', name: 'idx_users_role' },
     { sql: 'CREATE INDEX idx_listens_track ON listens(track_id)', name: 'idx_listens_track' },
     { sql: 'CREATE INDEX idx_listens_program ON listens(program_id)', name: 'idx_listens_program' },

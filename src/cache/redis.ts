@@ -9,8 +9,10 @@ if (process.env.REDIS_ENABLED === 'true') {
     password: process.env.REDIS_PASSWORD || undefined,
     maxRetriesPerRequest: 1,
     retryStrategy(times: number) {
-      if (times > 1) return null;
-      return 500;
+      // Keep reconnecting with a capped exponential backoff instead of giving
+      // up permanently, so the app recovers once Redis comes back without a
+      // restart. The cache is non-critical (see cacheGet) either way.
+      return Math.min(500 * Math.pow(2, Math.min(times, 6)), 30000);
     },
   });
 
