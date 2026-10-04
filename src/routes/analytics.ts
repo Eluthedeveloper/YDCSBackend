@@ -1,41 +1,61 @@
 import { Router, Response } from 'express';
 import { queryAll, queryOne } from '../database/schema';
 import { AuthRequest, authenticate, requireAdmin } from '../middleware/auth';
+import { cacheGet, cacheSet } from '../cache/redis';
+import { asyncHandler } from '../lib/asyncHandler';
 
 const router = Router();
 
-router.get('/', authenticate, requireAdmin, async (_req: AuthRequest, res: Response) => {
-  try {
-    const totalPrograms = (await queryOne('SELECT COUNT(*) as count FROM programs'))?.count || 0;
-    const totalTracks = (await queryOne('SELECT COUNT(*) as count FROM tracks'))?.count || 0;
-    const totalUsers = (await queryOne('SELECT COUNT(*) as count FROM users'))?.count || 0;
-    const totalComments = (await queryOne('SELECT COUNT(*) as count FROM comments'))?.count || 0;
-    const totalLikes = (await queryOne('SELECT COUNT(*) as count FROM likes'))?.count || 0;
+// These are aggregate scans over every row in listens/comments/tracks. Cheap
+// for a small catalog, expensive once it isn't, and the dashboard only needs
+// it fresh to within a minute.
+const CACHE_TTL = 60;
 
-    const programsByUser = await queryAll(`
+router.get('/', authenticate, requireAdmin, asyncHandler(async (_req: AuthRequest, res: Response) => {
+  const cached = await cacheGet('admin:analytics');
+  if (cached) return res.json(cached);
+
+  const [
+    programsRow, tracksRow, usersRow, commentsRow, likesRow, listensRow, listenersRow,
+    programsByUser,
+    tracksByType,
+    tracksByProgram,
+    mostLikedTracks,
+    recentComments,
+    programsByMonth,
+    tracksByMonth,
+    listensByMonth,
+    listenersByMonth,
+    commentsByMonth,
+  ] = await Promise.all([
+    queryOne('SELECT COUNT(*) as count FROM programs'),
+    queryOne('SELECT COUNT(*) as count FROM tracks'),
+    queryOne('SELECT COUNT(*) as count FROM users'),
+    queryOne('SELECT COUNT(*) as count FROM comments'),
+    queryOne('SELECT COUNT(*) as count FROM likes'),
+    queryOne('SELECT COUNT(*) as count FROM listens'),
+    queryOne('SELECT COUNT(DISTINCT fingerprint) as count FROM listens WHERE fingerprint IS NOT NULL'),
+    queryAll(`
       SELECT u.username, COUNT(p.id) as count
       FROM users u
       LEFT JOIN programs p ON u.id = p.created_by
       GROUP BY u.id
       ORDER BY count DESC
-    `);
-
-    const tracksByType = await queryAll(`
+    `),
+    queryAll(`
       SELECT track_type, COUNT(*) as count
       FROM tracks
       GROUP BY track_type
       ORDER BY count DESC
-    `);
-
-    const tracksByProgram = await queryAll(`
+    `),
+    queryAll(`
       SELECT p.title, COUNT(t.id) as count
       FROM programs p
       LEFT JOIN tracks t ON p.id = t.program_id
       GROUP BY p.id
       ORDER BY count DESC
-    `);
-
-    const mostLikedTracks = await queryAll(`
+    `),
+    queryAll(`
       SELECT t.title, t.artist, COUNT(l.id) as like_count, p.title as program_title
       FROM tracks t
       LEFT JOIN likes l ON t.id = l.track_id
@@ -43,77 +63,76 @@ router.get('/', authenticate, requireAdmin, async (_req: AuthRequest, res: Respo
       GROUP BY t.id
       ORDER BY like_count DESC
       LIMIT 10
-    `);
-
-    const recentComments = await queryAll(`
+    `),
+    queryAll(`
       SELECT c.*, p.title as program_title
       FROM comments c
       JOIN programs p ON c.program_id = p.id
       ORDER BY c.created_at DESC
       LIMIT 10
-    `);
-
-    const programsByMonth = await queryAll(`
+    `),
+    queryAll(`
       SELECT DATE_FORMAT(created_at, '%Y-%m') as month, COUNT(*) as count
       FROM programs
       GROUP BY month
       ORDER BY month DESC
       LIMIT 12
-    `);
-
-    const tracksByMonth = await queryAll(`
+    `),
+    queryAll(`
       SELECT DATE_FORMAT(created_at, '%Y-%m') as month, COUNT(*) as count
       FROM tracks
       GROUP BY month
       ORDER BY month DESC
       LIMIT 12
-    `);
-
-    const totalListens = (await queryOne('SELECT COUNT(*) as count FROM listens'))?.count || 0;
-    const totalListeners = (await queryOne('SELECT COUNT(DISTINCT fingerprint) as count FROM listens WHERE fingerprint IS NOT NULL'))?.count || 0;
-
-    const listensByMonth = await queryAll(`
+    `),
+    queryAll(`
       SELECT DATE_FORMAT(created_at, '%Y-%m') as month, COUNT(*) as count
       FROM listens
       GROUP BY month
       ORDER BY month DESC
       LIMIT 12
-    `);
-
-    const listenersByMonth = await queryAll(`
+    `),
+    queryAll(`
       SELECT DATE_FORMAT(created_at, '%Y-%m') as month, COUNT(DISTINCT fingerprint) as count
       FROM listens
       WHERE fingerprint IS NOT NULL
       GROUP BY month
       ORDER BY month DESC
       LIMIT 12
-    `);
-
-    const commentsByMonth = await queryAll(`
+    `),
+    queryAll(`
       SELECT DATE_FORMAT(created_at, '%Y-%m') as month, COUNT(*) as count
       FROM comments
       GROUP BY month
       ORDER BY month DESC
       LIMIT 12
-    `);
+    `),
+  ]);
 
-    res.json({
-      totals: { programs: totalPrograms, tracks: totalTracks, users: totalUsers, comments: totalComments, likes: totalLikes, listens: totalListens, listeners: totalListeners },
-      programsByUser,
-      tracksByType,
-      tracksByProgram,
-      mostLikedTracks,
-      recentComments,
-      programsByMonth,
-      tracksByMonth,
-      listensByMonth,
-      listenersByMonth,
-      commentsByMonth,
-    });
-  } catch (err) {
-    console.error('Error fetching analytics:', err);
-    res.status(500).json({ error: 'Failed to fetch analytics' });
-  }
-});
+  const payload = {
+    totals: {
+      programs: programsRow?.count || 0,
+      tracks: tracksRow?.count || 0,
+      users: usersRow?.count || 0,
+      comments: commentsRow?.count || 0,
+      likes: likesRow?.count || 0,
+      listens: listensRow?.count || 0,
+      listeners: listenersRow?.count || 0,
+    },
+    programsByUser,
+    tracksByType,
+    tracksByProgram,
+    mostLikedTracks,
+    recentComments,
+    programsByMonth,
+    tracksByMonth,
+    listensByMonth,
+    listenersByMonth,
+    commentsByMonth,
+  };
+
+  await cacheSet('admin:analytics', payload, CACHE_TTL);
+  res.json(payload);
+}));
 
 export default router;

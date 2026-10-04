@@ -13,9 +13,6 @@ dist/
 # Media uploads (large, not for version control)
 uploads/
 
-# Local database artifacts (code uses MySQL)
-database.sqlite
-
 # Archives / backups
 *.zip
 *.tar.gz

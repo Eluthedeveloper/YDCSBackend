@@ -2,18 +2,15 @@ import { Router, Response } from 'express';
 import nodemailer from 'nodemailer';
 import path from 'path';
 import fs from 'fs';
-import rateLimit from 'express-rate-limit';
+import { contactLimiter } from '../middleware/rateLimit';
+import { asyncHandler } from '../lib/asyncHandler';
 
 const router = Router();
 
-// Dedicated limiter so the contact form can't be used to spam the SMTP inbox.
-const contactLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many messages, please try again later.' },
-});
+const MAX_NAME = 100;
+const MAX_EMAIL = 254;
+const MAX_SUBJECT = 200;
+const MAX_MESSAGE = 5000;
 
 // Logo lives at asset/Logo.png relative to the project root.
 // Sent as a CID inline attachment so it renders reliably across email clients.
@@ -119,11 +116,29 @@ function infoRow(label: string, value: string): string {
     </tr>`;
 }
 
-router.post('/', contactLimiter, async (req, res: Response) => {
-  const { name, email, phone, subject, message, lang } = req.body;
+router.post('/', contactLimiter, asyncHandler(async (req, res: Response) => {
+  const asString = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+  const name = asString(req.body?.name);
+  const email = asString(req.body?.email);
+  const phone = asString(req.body?.phone);
+  const subject = asString(req.body?.subject);
+  const message = asString(req.body?.message);
+  const lang = asString(req.body?.lang);
 
   if (!name || !email || !subject || !message) {
     return res.status(400).json({ error: 'All fields are required' });
+  }
+
+  const limits: Array<[string, string, number]> = [
+    ['Name', name, MAX_NAME],
+    ['Email', email, MAX_EMAIL],
+    ['Subject', subject, MAX_SUBJECT],
+    ['Message', message, MAX_MESSAGE],
+  ];
+  for (const [label, value, max] of limits) {
+    if (value.length > max) {
+      return res.status(400).json({ error: `${label} must be ${max} characters or fewer` });
+    }
   }
 
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -137,11 +152,14 @@ router.post('/', contactLimiter, async (req, res: Response) => {
     return res.status(400).json({ error: 'Invalid phone number' });
   }
 
+  // Escaped here, at the only place these values become HTML. Doing this in
+  // middleware on the parsed body would instead corrupt the stored text.
   const safeName = escapeHtml(name);
   const safeEmail = escapeHtml(email);
   const safePhone = phone ? escapeHtml(phone) : '';
   const safeSubject = escapeHtml(subject);
   const safeMessage = escapeHtml(message).replace(/\n/g, '<br />');
+
 
   const CONTACT_PHONE = process.env.CONTACT_PHONE || '+251 XXX XXX XXX';
 
@@ -204,7 +222,7 @@ router.post('/', contactLimiter, async (req, res: Response) => {
       },
     };
 
-    const c = confirmEmail[lang as string] || confirmEmail.en;
+    const c = (confirmEmail[lang] ?? confirmEmail.en)!;
 
     const userBody = `
       <p style="margin:0 0 18px; font-size:15px; color:#3a3d45;">Dear ${safeName},</p>
@@ -226,24 +244,31 @@ router.post('/', contactLimiter, async (req, res: Response) => {
         </a>
       </div>`;
 
-    await transporter.sendMail({
-      from: `"${process.env.SMTP_FROM_NAME || 'YDCS Radio'}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
-      to: email,
-      subject: c.subject,
-      html: emailShell({
-        headerTitle: c.greeting,
-        headerSubtitle: c.subtitle,
-        bodyHtml: userBody,
-        footerText: `${c.footer} · ${CONTACT_PHONE}`,
-      }),
-      attachments: logoAttachments(),
-    });
+    // The admin copy above is the one that matters. If the guest's confirmation
+    // bounces the message still reached the church, so report success instead
+    // of telling the sender their message was lost.
+    try {
+      await transporter.sendMail({
+        from: `"${process.env.SMTP_FROM_NAME || 'YDCS Radio'}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
+        to: email,
+        subject: c.subject,
+        html: emailShell({
+          headerTitle: c.greeting,
+          headerSubtitle: c.subtitle,
+          bodyHtml: userBody,
+          footerText: `${c.footer} · ${CONTACT_PHONE}`,
+        }),
+        attachments: logoAttachments(),
+      });
+    } catch (confirmError) {
+      console.error('[contact] Confirmation email failed (admin copy was delivered):', confirmError);
+    }
 
     res.json({ success: true, message: 'Your message has been sent. We will contact you soon.' });
   } catch (error) {
     console.error('Contact form email error:', error);
     res.status(500).json({ error: 'Failed to send message. Please try again later.' });
   }
-});
+}));
 
 export default router;
