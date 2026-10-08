@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import multer from 'multer';
 import dotenv from 'dotenv';
 import path from 'path';
+import os from 'os';
 import fsSync from 'fs';
 
 import { initDB, closePool } from './database/schema';
@@ -35,15 +36,18 @@ const MIME_TYPES: Record<string, string> = {
 // capture every track the player streams.
 const INLINE_HEADERS = { 'Content-Disposition': 'inline' } as const;
 
-// INLINE_HEADERS alone is not enough. IDM classifies a response as a file to
-// save from the *extension in the URL* first, and a byte-range-capable audio/*
-// stream is its exact "resumable download" profile, so it captured every track
-// regardless of the disposition header.
+// INLINE_HEADERS alone is not enough. IDM first looks at the extension in the
+// URL, and when that is unrecognisable it falls back to the response
+// Content-Type — that is how a bare `.ts` module URL got saved as `metadata.JS`,
+// and how a `.stream` URL answered as `audio/mpeg` came back as a capture
+// prompt named `<uuid>.mp3`.
 //
-// Audio is therefore streamed from an extensionless `<uuid>.stream` URL. There
-// is no recognisable extension for IDM to build a download task around, so the
-// capture prompt never appears. The file on disk keeps its real extension, so
-// the stem is resolved back to it against the list below.
+// Audio is therefore streamed from an extensionless `<uuid>.stream` URL, and
+// that URL is answered with a neutral Content-Type instead of `audio/*`.
+// Browsers decode media from the bytes themselves, so playback is unaffected,
+// while download managers no longer see a media type to name a download after.
+// The file on disk keeps its real extension, so the stem is resolved back to it
+// against the list below.
 const STREAM_SUFFIX = '.stream';
 
 const AUDIO_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac'];
@@ -132,10 +136,9 @@ export function createApp() {
   app.use(
     cors({
       origin: [
-        'https://yemisrachdimts.elacodes.com',
+        'https://yemisrachdimts.org',
+        'https://www.yemisrachdimts.org',
         'http://localhost:5173',
-        'https://ydcsradio.elacodes.com',
-        'https://yemisrach.elacodes.com',
       ],
       methods: ['GET', 'POST', 'PUT', 'DELETE'],
       // x-client-fingerprint carries the anonymous listener id used for like and
@@ -151,6 +154,27 @@ export function createApp() {
   app.use('/api/', generalLimiter);
 
   console.log('Uploads directory:', UPLOADS_ROOT);
+
+  // TEMP DIAGNOSTIC (IDM capture investigation) — remove once resolved.
+  // Logs every uploads request to a file so we can see the exact URL the
+  // browser asks for and whether IDM fetches it again under its own UA.
+  const REQUEST_LOG =
+    process.env.REQUEST_LOG ||
+    (process.env.NODE_ENV === 'production' ? undefined : path.join(os.tmpdir(), 'audiostreaming-uploads.log'));
+  if (REQUEST_LOG) {
+    app.use('/api/uploads', (req, res, next) => {
+      const line = [
+        new Date().toISOString(),
+        req.method,
+        req.originalUrl,
+        `ua=${req.headers['user-agent'] || '-'}`,
+        `range=${req.headers.range || '-'}`,
+        `origin=${req.headers.origin || '-'}`,
+      ].join(' ');
+      fsSync.appendFile(REQUEST_LOG, line + '\n', () => {});
+      next();
+    });
+  }
 
   app.get('/api/uploads/:type/:filename', (req, res) => {
     const { type, filename } = req.params;
@@ -175,11 +199,14 @@ export function createApp() {
     }
 
     // Derived from the file that was actually found, not from the request name:
-    // a `.stream` request must still be answered as the audio type it is, or
-    // the <audio> element refuses it.
+    // a `.stream` request still needs byte ranges accepted, and the real type
+    // decides that. The declared type is neutral for `.stream` names so no
+    // Content-Type header tells a download manager this is media.
     const ext = path.extname(resolved).toLowerCase();
-    const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-    const isAudio = contentType.startsWith('audio/');
+    const realType = MIME_TYPES[ext] || 'application/octet-stream';
+    const isAudio = realType.startsWith('audio/');
+    const isStreamRequest = safeFilename.toLowerCase().endsWith(STREAM_SUFFIX);
+    const contentType = isStreamRequest ? 'application/octet-stream' : realType;
 
     fsSync.stat(resolved, (err, stat) => {
       if (err || !stat.isFile()) {

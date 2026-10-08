@@ -36,12 +36,13 @@ COPY --from=build /app/asset ./asset
 
 # The `node` user ships with the base image (uid/gid 1000). Running as root
 # would mean a container escape starts with root on the host.
-USER node
-
-# Created after the USER switch so they are owned by it. The bind mount in
-# docker-compose.yml overrides this with the host directory, so that one needs
-# to be writable by uid 1000 as well.
+# Created as root before the USER switch, then chowned to node so the runtime
+# process (uid 1000) owns them. The bind mount in docker-compose.yml overrides
+# this with the host directory, so that one needs to be writable by uid 1000 as
+# well.
 RUN mkdir -p /app/uploads/tracks /app/uploads/covers && chown -R node:node /app/uploads
+
+USER node
 
 EXPOSE 7000
 

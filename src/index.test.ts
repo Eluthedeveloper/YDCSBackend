@@ -171,8 +171,10 @@ describe('GET /api/uploads/:type/:filename', () => {
 
   // The player streams from `<uuid>.stream` so IDM has no file extension to
   // build a download task around. The stem has to resolve back to the real file
-  // on disk, and the response still has to be typed as audio or the <audio>
-  // element refuses to play it.
+  // on disk, and the response must stay byte-range capable for seeking. The
+  // declared type is deliberately neutral (not `audio/*`) so a download manager
+  // sniffing Content-Type has no media type to name a capture after; the
+  // browser decodes the audio from the bytes regardless.
   it('resolves an extensionless .stream name back to the audio file', async () => {
     const res = await request(app)
       .get('/api/uploads/tracks/vitest-audio.stream')
@@ -184,7 +186,7 @@ describe('GET /api/uploads/:type/:filename', () => {
       });
 
     expect(res.status).toBe(200);
-    expect(res.headers['content-type']).toContain('audio/mpeg');
+    expect(res.headers['content-type']).toContain('application/octet-stream');
     expect(res.headers['accept-ranges']).toBe('bytes');
     expect(res.headers['content-disposition']).toBe('inline');
     expect(asBuffer(res)).toBe('A'.repeat(1000));
@@ -213,7 +215,7 @@ describe('GET /api/uploads/:type/:filename', () => {
     const res = await request(app).get('/api/uploads/tracks/vitest-shouty.stream');
 
     expect(res.status).toBe(200);
-    expect(res.headers['content-type']).toContain('audio/mpeg');
+    expect(res.headers['content-type']).toContain('application/octet-stream');
   });
 
   it('returns 404 for a .stream stem with no matching file', async () => {
