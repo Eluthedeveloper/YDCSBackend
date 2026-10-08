@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { queryAll, queryOne, runSQL } from '../database/schema';
 import { cacheGet, cacheSet, cacheDelete } from '../cache/redis';
+import { programReadCacheKeys } from '../lib/cacheKeys';
 import { interactionLimiter } from '../middleware/rateLimit';
 import { asyncHandler } from '../lib/asyncHandler';
 
@@ -20,6 +21,20 @@ interface TrackRef {
 const CLIENT_ID_HEADER = 'x-client-fingerprint';
 const FINGERPRINT_RE = /^[A-Za-z0-9_-]{8,255}$/;
 
+// MySQL's ER_DUP_ENTRY, reused from the unique-key handling on the like toggle.
+const ER_DUP_ENTRY = 1062;
+
+/**
+ * Window in which repeat plays of one track by one listener count once.
+ *
+ * The deduplication the header comment promises is this check: without it a
+ * single listener replaying a track, or a retrying client, inflates the play
+ * counts the analytics dashboard reports. Best-effort — two concurrent requests
+ * can both pass it — because the consequence is one extra row in a reporting
+ * table, and making it exact would need a bucketed unique key and a migration.
+ */
+const LISTEN_DEDUP_SECONDS = 30 * 60;
+
 function readFingerprint(req: { get(name: string): string | undefined }, body?: unknown): string | null {
   const candidate = req.get(CLIENT_ID_HEADER) || (body as { fingerprint?: unknown })?.fingerprint;
   if (typeof candidate !== 'string') return null;
@@ -30,11 +45,11 @@ function readFingerprint(req: { get(name: string): string | undefined }, body?: 
 /**
  * Every cached payload that embeds a like or comment count for a program.
  * Invalidating by exact key keeps a like from forcing a full SCAN over the
- * keyspace, and covering all three keys is what stops the counters from
- * disagreeing between the list view and the detail view.
+ * keyspace, and covering every key is what stops the counters from disagreeing
+ * between the list view, the detail view and the analytics dashboard.
  */
 function programCacheKeys(programId: string): string[] {
-  return ['public:programs', 'public:latest-tracks', `public:program:${programId}`];
+  return programReadCacheKeys(programId);
 }
 
 router.get('/programs', asyncHandler(async (_req, res: Response) => {
@@ -196,13 +211,26 @@ router.post('/tracks/:id/like', interactionLimiter, asyncHandler(async (req, res
     await runSQL('DELETE FROM likes WHERE id = ?', [existing.id]);
     await cacheDelete(...programCacheKeys(track.program_id));
     res.json({ liked: false });
-  } else {
-    const id = uuidv4();
+    return;
+  }
+
+  const id = uuidv4();
+  try {
     await runSQL('INSERT INTO likes (id, track_id, fingerprint) VALUES (?, ?, ?)',
       [id, req.params.id, fingerprint]);
-    await cacheDelete(...programCacheKeys(track.program_id));
-    res.json({ liked: true });
+  } catch (err) {
+    // Check-then-act: two clicks landing together both miss the SELECT above,
+    // and `unique_like (track_id, fingerprint)` then rejects the second INSERT.
+    // The like did land, so this is the success path, not a failure — reporting
+    // it as a 500 left the client showing a heart that never filled.
+    if ((err as { errno?: number })?.errno === ER_DUP_ENTRY) {
+      await cacheDelete(...programCacheKeys(track.program_id));
+      return res.json({ liked: true });
+    }
+    throw err;
   }
+  await cacheDelete(...programCacheKeys(track.program_id));
+  res.json({ liked: true });
 }));
 
 router.get('/tracks/:id/likes', asyncHandler(async (req, res: Response) => {
@@ -229,6 +257,14 @@ router.post('/tracks/:id/listen', interactionLimiter, asyncHandler(async (req, r
   const track = await queryOne<TrackRef>('SELECT id, program_id FROM tracks WHERE id = ?', [req.params.id]);
   if (!track) return res.status(404).json({ error: 'Track not found' });
 
+  const recent = await queryOne(
+    `SELECT id FROM listens
+     WHERE track_id = ? AND fingerprint = ? AND created_at > (NOW() - INTERVAL ? SECOND)
+     LIMIT 1`,
+    [track.id, fingerprint, LISTEN_DEDUP_SECONDS]
+  );
+  if (recent) return res.json({ success: true, counted: false });
+
   const id = uuidv4();
   await runSQL('INSERT INTO listens (id, track_id, program_id, fingerprint) VALUES (?, ?, ?, ?)',
     [id, track.id, track.program_id, fingerprint]);
@@ -236,7 +272,7 @@ router.post('/tracks/:id/listen', interactionLimiter, asyncHandler(async (req, r
   // No cache invalidate here: a listen never changes any cached program/track
   // payload, and flushing the whole cache on every play would defeat caching
   // under streaming load. The listens stats key self-expires in 60s.
-  res.json({ success: true });
+  res.json({ success: true, counted: true });
 }));
 
 router.get('/listens/stats', asyncHandler(async (_req, res: Response) => {

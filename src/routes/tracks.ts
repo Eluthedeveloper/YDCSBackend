@@ -3,16 +3,25 @@ import { v4 as uuidv4 } from 'uuid';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs/promises';
-import { queryAll, queryOne, runSQL, getPool } from '../database/schema';
+import type mysql from 'mysql2/promise';
+import { queryAll, queryOne, runSQL, getPool, withTransaction } from '../database/schema';
 import { AuthRequest, authenticate, requireSuperAdmin, requireAdmin } from '../middleware/auth';
 import { writeLimiter } from '../middleware/rateLimit';
-import { cacheInvalidate } from '../cache/redis';
+import { cacheDelete } from '../cache/redis';
+import { programReadCacheKeys } from '../lib/cacheKeys';
+import { singleString, coerceDuration } from '../lib/validate';
 import { asyncHandler } from '../lib/asyncHandler';
 
 const router = Router();
 
 const TRACK_TYPES = ['episode', 'single', 'mix', 'live'] as const;
+type TrackType = (typeof TRACK_TYPES)[number];
+
 const MAX_BULK_FILES = 50;
+
+// A reorder issues one UPDATE per id, so the array length is what bounds the
+// work done while holding a pool connection. 50 matches the bulk upload cap.
+const MAX_REORDER_IDS = 50;
 
 // Mirrors the VARCHAR(255) column widths. Without this, MySQL in strict mode
 // rejects the statement outright and the request fails as an opaque 500 rather
@@ -20,6 +29,29 @@ const MAX_BULK_FILES = 50;
 const MAX_TITLE = 255;
 const MAX_ARTIST = 255;
 const MAX_ALBUM = 255;
+
+/**
+ * Reserves the next sort_order for a track in `programId`.
+ *
+ * `COUNT(*)` was used for this, which is wrong twice over: deleting a track from
+ * the middle of a list drops the count, so the next upload reuses a live
+ * sort_order; and two concurrent uploads both read the same count and both
+ * insert it. Either collision leaves `ORDER BY sort_order, created_at` — the
+ * order the whole player depends on — nondeterministic. `MAX + 1` under a row
+ * lock closes both.
+ *
+ * Must be called inside a transaction so the lock is held through the INSERT.
+ */
+async function reserveSortOrder(
+  conn: mysql.PoolConnection,
+  programId: string
+): Promise<number> {
+  const [rows] = await conn.execute<any[]>(
+    'SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM tracks WHERE program_id = ? FOR UPDATE',
+    [programId]
+  );
+  return Number(rows[0]?.next ?? 0);
+}
 
 interface TrackRow {
   id: string;
@@ -54,7 +86,14 @@ const trackStorage = multer.diskStorage({
 
 const uploadTrack = multer({
   storage: trackStorage,
-  limits: { fileSize: 100 * 1024 * 1024, files: MAX_BULK_FILES },
+  limits: {
+    fileSize: 100 * 1024 * 1024,
+    files: MAX_BULK_FILES,
+    // busboy applies no default cap on non-file fields, so `titles`/`artists`/
+    // `albums` were unbounded in both count and size on a 50-file batch.
+    fields: 200,
+    fieldSize: 1024,
+  },
   fileFilter: (_req, file, cb) => {
     // Anchored against the full extension so `evil.mp3.html` can't pass on a
     // substring match, and the client-supplied mimetype must agree.
@@ -79,7 +118,7 @@ router.get('/program/:programId', authenticate, requireAdmin, asyncHandler(async
 }));
 
 router.post('/', writeLimiter, authenticate, requireAdmin, uploadTrack.single('audio_file'), asyncHandler(async (req: AuthRequest, res: Response) => {
-  const { title, artist, album, program_id, track_type, duration } = req.body ?? {};
+  const { title, artist, album, program_id, track_type } = req.body ?? {};
 
   // Every branch below has to release req.file, so validation failures are
   // funnelled through this one helper rather than repeating cleanupFiles.
@@ -88,51 +127,63 @@ router.post('/', writeLimiter, authenticate, requireAdmin, uploadTrack.single('a
     return res.status(status).json({ error });
   };
 
-  if (!title || !title.trim()) {
-    return invalid('Title is required');
-  }
-  if (String(title).trim().length > MAX_TITLE) {
+  const cleanTitle = singleString(title);
+  if (!cleanTitle) return invalid('Title is required');
+  if (cleanTitle.length > MAX_TITLE) {
     return invalid(`Title must be ${MAX_TITLE} characters or fewer`);
   }
-  for (const [label, value, max] of [['Artist', artist, MAX_ARTIST], ['Album', album, MAX_ALBUM]] as const) {
-    if (typeof value === 'string' && value.length > max) {
-      return invalid(`${label} must be ${max} characters or fewer`);
-    }
+
+  const cleanArtist = singleString(artist);
+  const cleanAlbum = singleString(album);
+  if (cleanArtist && cleanArtist.length > MAX_ARTIST) {
+    return invalid(`Artist must be ${MAX_ARTIST} characters or fewer`);
   }
-  if (!program_id) {
-    return invalid('Program ID is required');
-  }
-  if (!req.file) {
-    return res.status(400).json({ error: 'Audio file required' });
-  }
-  if (track_type && !TRACK_TYPES.includes(track_type)) {
-    return invalid('Invalid track type');
-  }
-  if (duration !== undefined && (typeof duration !== 'number' || isNaN(duration) || duration < 0)) {
-    return invalid('Invalid duration');
+  if (cleanAlbum && cleanAlbum.length > MAX_ALBUM) {
+    return invalid(`Album must be ${MAX_ALBUM} characters or fewer`);
   }
 
-  const program = await queryOne('SELECT id FROM programs WHERE id = ?', [program_id]);
+  const cleanProgramId = singleString(program_id);
+  if (!cleanProgramId) return invalid('Program ID is required');
+
+  const cleanTrackType = singleString(track_type) || 'episode';
+  if (!TRACK_TYPES.includes(cleanTrackType as TrackType)) {
+    return invalid('Invalid track type');
+  }
+
+  const duration = coerceDuration(req.body?.duration, 0);
+  if (duration === null) return invalid('Invalid duration');
+
+  if (!req.file) return invalid('Audio file required');
+
+  const program = await queryOne('SELECT id FROM programs WHERE id = ?', [cleanProgramId]);
   if (!program) {
     // A missing parent is a 404, not a bad request: keep the status the caller
     // saw before validation was factored into the helper.
     return invalid('Program not found', 404);
   }
 
-  const existingCount = await queryOne<{ count: number }>(
-    'SELECT COUNT(*) as count FROM tracks WHERE program_id = ?',
-    [program_id]
-  );
-  const sortOrder = Number(existingCount?.count ?? 0);
-
   const id = uuidv4();
-  await runSQL(
-    'INSERT INTO tracks (id, title, artist, album, duration, file_path, program_id, track_type, sort_order, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [id, title.trim(), artist || null, album || null, duration || 0, req.file.filename, program_id, track_type || 'episode', sortOrder, req.user!.id]
-  );
+  let sortOrder: number;
+  try {
+    // The row lock taken by reserveSortOrder has to be held through the INSERT,
+    // so both statements share one transaction.
+    sortOrder = await withTransaction(async (conn) => {
+      const next = await reserveSortOrder(conn, cleanProgramId);
+      await conn.execute(
+        'INSERT INTO tracks (id, title, artist, album, duration, file_path, program_id, track_type, sort_order, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [id, cleanTitle, cleanArtist || null, cleanAlbum || null, duration, req.file!.filename, cleanProgramId, cleanTrackType, next, req.user!.id]
+      );
+      return next;
+    });
+  } catch (err) {
+    // Multer has already written the upload to disk. Without this the file is
+    // orphaned the moment the INSERT fails, with no row to ever find it by.
+    cleanupFiles([req.file]);
+    throw err;
+  }
 
-  await cacheInvalidate('public:*');
-  res.status(201).json({ id, title: title.trim(), artist, album, file_path: req.file.filename, program_id, track_type, sort_order: sortOrder });
+  await cacheDelete(...programReadCacheKeys(cleanProgramId));
+  res.status(201).json({ id, title: cleanTitle, artist, album, file_path: req.file.filename, program_id: cleanProgramId, track_type: cleanTrackType, sort_order: sortOrder });
 }));
 
 router.post('/bulk', writeLimiter, authenticate, requireAdmin, uploadTrack.array('audio_files', MAX_BULK_FILES), asyncHandler(async (req: AuthRequest, res: Response) => {
@@ -172,21 +223,20 @@ router.post('/bulk', writeLimiter, authenticate, requireAdmin, uploadTrack.array
     const program = await queryOne('SELECT id FROM programs WHERE id = ?', [program_id]);
     if (!program) return reject(404, 'Program not found');
 
-    const existingCount = await queryOne<{ count: number }>(
-      'SELECT COUNT(*) as count FROM tracks WHERE program_id = ?',
-      [program_id]
-    );
-    let sortOrder = Number(existingCount?.count ?? 0);
-
     const pool = getPool();
     const conn = await pool.getConnection();
     const uploaded: Array<{ id: string; title: string; file_path: string; sort_order: number }> = [];
     try {
       await conn.beginTransaction();
+      let sortOrder = await reserveSortOrder(conn, program_id);
       for (let i = 0; i < files.length; i++) {
         const file = files[i]!;
         const id = uuidv4();
-        const trackTitle = (titles[i] ? String(titles[i]).trim() : '') || file.originalname.replace(/\.[^.]+$/, '');
+        // The fallback is derived from a client-supplied filename, so it is
+        // unbounded too: without the clamp a long filename overflows VARCHAR(255),
+        // the INSERT throws, the transaction rolls back and a legitimate upload
+        // fails with a 500.
+        const trackTitle = ((titles[i] ? String(titles[i]).trim() : '') || file.originalname.replace(/\.[^.]+$/, '')).slice(0, MAX_TITLE);
         const artist = artists[i] ? String(artists[i]).trim() || null : null;
         const album = albums[i] ? String(albums[i]).trim() || null : null;
         await conn.execute(
@@ -206,7 +256,7 @@ router.post('/bulk', writeLimiter, authenticate, requireAdmin, uploadTrack.array
       conn.release();
     }
 
-    await cacheInvalidate('public:*');
+    await cacheDelete(...programReadCacheKeys(program_id));
     res.status(201).json({ uploaded: uploaded.length, tracks: uploaded });
   } catch (err) {
     // Any error thrown after cleanupFiles already ran is a no-op unlink.
@@ -220,7 +270,7 @@ router.put('/:id', writeLimiter, authenticate, requireAdmin, asyncHandler(async 
   const track = await queryOne<TrackRow>('SELECT * FROM tracks WHERE id = ?', [req.params.id]);
   if (!track) return res.status(404).json({ error: 'Track not found' });
 
-  const { title, artist, album, track_type, duration } = req.body ?? {};
+  const { title, artist, album, track_type } = req.body ?? {};
 
   if (title !== undefined && (typeof title !== 'string' || !title.trim())) {
     return res.status(400).json({ error: 'Invalid title' });
@@ -236,7 +286,10 @@ router.put('/:id', writeLimiter, authenticate, requireAdmin, asyncHandler(async 
   if (track_type && !TRACK_TYPES.includes(track_type)) {
     return res.status(400).json({ error: 'Invalid track type' });
   }
-  if (duration !== undefined && (typeof duration !== 'number' || isNaN(duration) || duration < 0)) {
+  // A track always has some duration, so an absent field falls back to the
+  // stored value rather than to 0.
+  const updatedDuration = coerceDuration(req.body?.duration, track.duration);
+  if (updatedDuration === null) {
     return res.status(400).json({ error: 'Invalid duration' });
   }
 
@@ -246,12 +299,11 @@ router.put('/:id', writeLimiter, authenticate, requireAdmin, asyncHandler(async 
   const updatedArtist = artist !== undefined ? (artist || null) : track.artist;
   const updatedAlbum = album !== undefined ? (album || null) : track.album;
   const updatedType = track_type || track.track_type;
-  const updatedDuration = duration !== undefined && !isNaN(duration) ? duration : track.duration;
 
   await runSQL('UPDATE tracks SET title = ?, artist = ?, album = ?, track_type = ?, duration = ? WHERE id = ?',
     [updatedTitle, updatedArtist, updatedAlbum, updatedType, updatedDuration, req.params.id]);
 
-  await cacheInvalidate('public:*');
+  await cacheDelete(...programReadCacheKeys(track.program_id));
   res.json({ message: 'Track updated' });
 }));
 
@@ -260,39 +312,45 @@ router.put('/reorder/:programId', writeLimiter, authenticate, requireAdmin, asyn
   if (!Array.isArray(trackIds) || trackIds.length === 0) {
     return res.status(400).json({ error: 'trackIds array required' });
   }
-
-  const pool = getPool();
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    for (let index = 0; index < trackIds.length; index++) {
-      await conn.execute('UPDATE tracks SET sort_order = ? WHERE id = ? AND program_id = ?',
-        [index, trackIds[index], req.params.programId]);
-    }
-    await conn.commit();
-  } catch (e) {
-    await conn.rollback();
-    throw e;
-  } finally {
-    conn.release();
+  // Each id costs one UPDATE on the same connection, so an unbounded array
+  // monopolises a slot from the pool of 10 for as long as it runs.
+  if (trackIds.length > MAX_REORDER_IDS) {
+    return res.status(400).json({ error: `At most ${MAX_REORDER_IDS} tracks can be reordered at once` });
+  }
+  // mysql2 cannot bind an object or an array, and ids reach this point straight
+  // from the request body.
+  if (!trackIds.every((id: unknown) => typeof id === 'string' && id.length > 0)) {
+    return res.status(400).json({ error: 'trackIds must be non-empty strings' });
   }
 
-  await cacheInvalidate('public:*');
+  const programId = singleString(req.params.programId);
+  if (!programId) return res.status(400).json({ error: 'Invalid program id' });
+
+  await withTransaction(async (conn) => {
+    for (let index = 0; index < trackIds.length; index++) {
+      await conn.execute('UPDATE tracks SET sort_order = ? WHERE id = ? AND program_id = ?',
+        [index, trackIds[index], programId]);
+    }
+  });
+
+  await cacheDelete(...programReadCacheKeys(programId));
   res.json({ message: 'Order updated' });
 }));
 
 router.delete('/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
-  const track = await queryOne<{ file_path: string | null }>(
-    'SELECT file_path FROM tracks WHERE id = ?',
+  const track = await queryOne<{ file_path: string | null; program_id: string }>(
+    'SELECT file_path, program_id FROM tracks WHERE id = ?',
     [req.params.id]
   );
   if (!track) return res.status(404).json({ error: 'Track not found' });
 
   await runSQL('DELETE FROM tracks WHERE id = ?', [req.params.id]);
-  await cacheInvalidate('public:*');
+  await cacheDelete(...programReadCacheKeys(track.program_id));
 
   if (track.file_path) {
-    fs.unlink(path.join(UPLOADS_ROOT, 'tracks', track.file_path)).catch(() => {});
+    // basename() as defence in depth: file_path is server-generated, but the
+    // unlink runs against the filesystem and should never be steerable by it.
+    fs.unlink(path.join(UPLOADS_ROOT, 'tracks', path.basename(track.file_path))).catch(() => {});
   }
 
   res.json({ message: 'Track deleted' });

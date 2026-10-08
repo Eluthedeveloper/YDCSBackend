@@ -18,8 +18,9 @@ used; the suite runs on Vitest.
 
 ## Configuration
 
-Copy `../docker-compose.env.example` to `.env` at the repository root and fill
-in the placeholders. Never commit the filled-in file.
+Copy `docker-compose.env.example` to `.env` in this directory and fill in the
+placeholders. Never commit the filled-in file. One `.env` serves both
+`npm run dev` and `docker compose`.
 
 | Variable | Notes |
 | --- | --- |

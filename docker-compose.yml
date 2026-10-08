@@ -1,0 +1,98 @@
+name: audiostreaming
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-audiostreaming}
+      MYSQL_USER: ${MYSQL_USER:-audio}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-audio}
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    # Bound to loopback on a non-default host port so a backend started outside
+    # Docker (`npm run dev`) can reach the same database. Another MySQL already
+    # owns host port 3306, hence the offset. Never expose this beyond 127.0.0.1.
+    ports:
+      - "127.0.0.1:${DB_HOST_PORT:-3307}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 7000
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      TRUST_PROXY: "true"
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_USER: ${MYSQL_USER:-audio}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-audio}
+      DB_NAME: ${MYSQL_DATABASE:-audiostreaming}
+      REDIS_ENABLED: "${REDIS_ENABLED:-true}"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ""
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_SECURE: "${SMTP_SECURE:-false}"
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-YDCS Radio}
+      CONTACT_RECEIVER: ${CONTACT_RECEIVER:-}
+      CONTACT_PHONE: ${CONTACT_PHONE:-}
+    volumes:
+      # Bind mount, not a named volume. The backend also runs outside Docker on
+      # the host against this same database, so a named volume would give the
+      # two processes separate upload directories over shared rows: whichever
+      # one served the DELETE unlinked from its own filesystem, the other
+      # copy survived, and the FK cascade had already removed the tracks row so
+      # no later delete could ever find the file again.
+      - ./uploads:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ../frontend
+      args:
+        VITE_API_URL: /api
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - backend
+
+volumes:
+  mysql_data:
+  redis_data:

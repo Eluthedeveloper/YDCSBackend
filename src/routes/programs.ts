@@ -6,7 +6,9 @@ import fs from 'fs/promises';
 import { queryAll, queryOne, runSQL } from '../database/schema';
 import { AuthRequest, authenticate, requireSuperAdmin, requireAdmin } from '../middleware/auth';
 import { writeLimiter } from '../middleware/rateLimit';
-import { cacheInvalidate } from '../cache/redis';
+import { cacheDelete } from '../cache/redis';
+import { programReadCacheKeys } from '../lib/cacheKeys';
+import { singleString } from '../lib/validate';
 import { asyncHandler } from '../lib/asyncHandler';
 
 const router = Router();
@@ -60,25 +62,50 @@ function removeCover(filename?: string | null) {
   }
 }
 
-router.get('/', authenticate, requireAdmin, asyncHandler(async (_req, res: Response) => {
+/**
+ * Hard ceiling on rows returned by a list endpoint.
+ *
+ * These listings had no LIMIT at all, so one request materialised the entire
+ * catalogue (and, for comments, every comment ever posted) into memory. The
+ * default equals the ceiling so an ordinary catalogue behaves exactly as it did
+ * before, while a client can still page explicitly and can never ask for an
+ * unbounded set.
+ */
+const MAX_PAGE_SIZE = 200;
+
+/** Clamps `?limit`/`?offset` to server-chosen bounds. */
+function pagination(query: Record<string, unknown>): { limit: number; offset: number } {
+  const rawLimit = Number.parseInt(String(query.limit ?? ''), 10);
+  const rawOffset = Number.parseInt(String(query.offset ?? ''), 10);
+  return {
+    limit: Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, MAX_PAGE_SIZE) : MAX_PAGE_SIZE,
+    offset: Number.isFinite(rawOffset) && rawOffset > 0 ? rawOffset : 0,
+  };
+}
+
+router.get('/', authenticate, requireAdmin, asyncHandler(async (req, res: Response) => {
+  const { limit, offset } = pagination(req.query as Record<string, unknown>);
   const programs = await queryAll(`
     SELECT p.*, u.username as creator_name,
       (SELECT COUNT(*) FROM tracks WHERE program_id = p.id) as track_count
     FROM programs p
     JOIN users u ON p.created_by = u.id
     ORDER BY p.created_at DESC
-  `);
+    LIMIT ? OFFSET ?
+  `, [limit, offset]);
   res.json(programs);
 }));
 
 // Registered before '/:id' so "comments" is never parsed as a program id.
-router.get('/comments/all', authenticate, requireAdmin, asyncHandler(async (_req, res: Response) => {
+router.get('/comments/all', authenticate, requireAdmin, asyncHandler(async (req, res: Response) => {
+  const { limit, offset } = pagination(req.query as Record<string, unknown>);
   const comments = await queryAll(`
     SELECT c.*, p.title as program_title
     FROM comments c
     JOIN programs p ON c.program_id = p.id
     ORDER BY c.created_at DESC
-  `);
+    LIMIT ? OFFSET ?
+  `, [limit, offset]);
   res.json(comments);
 }));
 
@@ -92,7 +119,11 @@ router.get('/:id', authenticate, requireAdmin, asyncHandler(async (req, res: Res
 
   if (!program) return res.status(404).json({ error: 'Program not found' });
 
-  const tracks = await queryAll('SELECT * FROM tracks WHERE program_id = ? ORDER BY sort_order ASC, created_at ASC', [req.params.id]);
+  const { limit, offset } = pagination(req.query as Record<string, unknown>);
+  const tracks = await queryAll(
+    'SELECT * FROM tracks WHERE program_id = ? ORDER BY sort_order ASC, created_at ASC LIMIT ? OFFSET ?',
+    [req.params.id, limit, offset]
+  );
 
   res.json({ ...program, tracks });
 }));
@@ -100,15 +131,21 @@ router.get('/:id', authenticate, requireAdmin, asyncHandler(async (req, res: Res
 router.post('/', writeLimiter, authenticate, requireAdmin, uploadCover.single('cover_image'), asyncHandler(async (req: AuthRequest, res: Response) => {
   try {
     const { title, description } = req.body ?? {};
-    if (!title || !title.trim()) {
+
+    // A repeated field (`?title=a&title=b`) arrives as an array; `.trim()` on it
+    // throws and the array cannot be bound by mysql2, so both are reported as
+    // a 400 instead of an opaque 500.
+    const cleanTitle = singleString(title);
+    if (!cleanTitle) {
       removeCover(req.file?.filename);
       return res.status(400).json({ error: 'Title is required' });
     }
-    if (String(title).trim().length > MAX_TITLE) {
+    if (cleanTitle.length > MAX_TITLE) {
       removeCover(req.file?.filename);
       return res.status(400).json({ error: `Title must be ${MAX_TITLE} characters or fewer` });
     }
-    if (typeof description === 'string' && description.length > MAX_DESCRIPTION) {
+    const cleanDescription = singleString(description);
+    if (cleanDescription && cleanDescription.length > MAX_DESCRIPTION) {
       removeCover(req.file?.filename);
       return res.status(400).json({ error: `Description must be ${MAX_DESCRIPTION} characters or fewer` });
     }
@@ -117,10 +154,10 @@ router.post('/', writeLimiter, authenticate, requireAdmin, uploadCover.single('c
     const cover_image = req.file ? req.file.filename : null;
 
     await runSQL('INSERT INTO programs (id, title, description, cover_image, created_by) VALUES (?, ?, ?, ?, ?)',
-      [id, title.trim(), description || null, cover_image, req.user!.id]);
+      [id, cleanTitle, cleanDescription || null, cover_image, req.user!.id]);
 
-    await cacheInvalidate('public:*');
-    res.status(201).json({ id, title: title.trim(), description, cover_image, created_by: req.user!.id });
+    await cacheDelete(...programReadCacheKeys(id));
+    res.status(201).json({ id, title: cleanTitle, description, cover_image, created_by: req.user!.id });
   } catch (err) {
     removeCover(req.file?.filename);
     throw err;
@@ -141,11 +178,13 @@ router.put('/:id', writeLimiter, authenticate, requireAdmin, uploadCover.single(
 
   const { title, description } = req.body ?? {};
 
-  if (typeof title === 'string' && title.trim().length > MAX_TITLE) {
+  const cleanTitle = singleString(title);
+  if (cleanTitle && cleanTitle.length > MAX_TITLE) {
     removeCover(req.file?.filename);
     return res.status(400).json({ error: `Title must be ${MAX_TITLE} characters or fewer` });
   }
-  if (typeof description === 'string' && description.length > MAX_DESCRIPTION) {
+  const cleanDescription = singleString(description);
+  if (cleanDescription && cleanDescription.length > MAX_DESCRIPTION) {
     removeCover(req.file?.filename);
     return res.status(400).json({ error: `Description must be ${MAX_DESCRIPTION} characters or fewer` });
   }
@@ -154,8 +193,8 @@ router.put('/:id', writeLimiter, authenticate, requireAdmin, uploadCover.single(
 
   // Description is cleared by sending an empty string, matching how artist and
   // album are handled in tracks.ts; absent fields keep their current value.
-  const updatedTitle = title !== undefined && title.trim() ? title.trim() : program.title;
-  const updatedDescription = description !== undefined ? (description || null) : program.description;
+  const updatedTitle = cleanTitle || program.title;
+  const updatedDescription = description !== undefined ? (cleanDescription || null) : program.description;
 
   await runSQL('UPDATE programs SET title = ?, description = ?, cover_image = ? WHERE id = ?',
     [updatedTitle, updatedDescription, cover_image, req.params.id]);
@@ -166,7 +205,7 @@ router.put('/:id', writeLimiter, authenticate, requireAdmin, uploadCover.single(
     removeCover(program.cover_image);
   }
 
-  await cacheInvalidate('public:*');
+  await cacheDelete(...programReadCacheKeys(req.params.id));
   res.json({ message: 'Program updated' });
 }));
 
@@ -174,9 +213,11 @@ router.get('/:id/comments', authenticate, requireAdmin, asyncHandler(async (req,
   const program = await queryOne('SELECT id FROM programs WHERE id = ?', [req.params.id]);
   if (!program) return res.status(404).json({ error: 'Program not found' });
 
-  const comments = await queryAll(`
-    SELECT * FROM comments WHERE program_id = ? ORDER BY created_at DESC
-  `, [req.params.id]);
+  const { limit, offset } = pagination(req.query as Record<string, unknown>);
+  const comments = await queryAll(
+    'SELECT * FROM comments WHERE program_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?',
+    [req.params.id, limit, offset]
+  );
 
   res.json(comments);
 }));
@@ -192,7 +233,9 @@ router.delete('/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandle
   // tracks and comments cascade from programs, so deleting the program is
   // enough; deleting tracks explicitly first only risks a partial failure.
   await runSQL('DELETE FROM programs WHERE id = ?', [req.params.id]);
-  await cacheInvalidate('public:*');
+  // The per-program key is dropped explicitly because the program it names no
+  // longer exists; the shared keys cover the list and track views.
+  await cacheDelete(...programReadCacheKeys(req.params.id));
 
   for (const track of tracks) {
     if (track.file_path) {

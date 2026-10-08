@@ -222,7 +222,12 @@ router.post('/', contactLimiter, asyncHandler(async (req, res: Response) => {
       },
     };
 
-    const c = (confirmEmail[lang] ?? confirmEmail.en)!;
+    // `Object.hasOwn` rather than `confirmEmail[lang] ?? confirmEmail.en`: `lang`
+    // is unvalidated, so `?lang=constructor` resolves up the prototype chain,
+    // the nullish fallback never fires, and every `c.*` reads undefined — the
+    // guest gets a confirmation mail with no subject and the literal text
+    // "undefined" throughout.
+    const c = (Object.prototype.hasOwnProperty.call(confirmEmail, lang) ? confirmEmail[lang] : confirmEmail.en)!;
 
     const userBody = `
       <p style="margin:0 0 18px; font-size:15px; color:#3a3d45;">Dear ${safeName},</p>

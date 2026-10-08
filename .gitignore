@@ -3,12 +3,22 @@ node_modules/
 
 # Build output
 dist/
+build/
 
-# Environment variables
+# Environment variables (holds MYSQL_ROOT_PASSWORD, JWT_SECRET and SMTP_PASS)
 .env
+.env.*
+!.env.example
+docker-compose.env
 
 # Logs
 *.log
+npm-debug.log*
+logs/
+
+# Test + coverage output
+coverage/
+.nyc_output/
 
 # Media uploads (large, not for version control)
 uploads/
@@ -24,3 +34,4 @@ Thumbs.db
 # Editor
 .vscode/
 .idea/
+*.swp

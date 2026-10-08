@@ -120,7 +120,9 @@ describe('POST /api/public/programs/:id/comments', () => {
   });
 
   // comment_count lives in the list view too, so clearing only the detail key
-  // left the two views disagreeing for the length of the cache TTL.
+  // left the two views disagreeing for the length of the cache TTL. The
+  // analytics dashboard embeds the same counts and used to be missed entirely,
+  // leaving it stale until its own 60s TTL expired.
   it('invalidates every cache entry that embeds the comment count', async () => {
     db.queryOne.mockResolvedValueOnce({ id: 'p1' }).mockResolvedValueOnce({ id: 'c1' });
 
@@ -131,6 +133,8 @@ describe('POST /api/public/programs/:id/comments', () => {
     expect(cache.del).toHaveBeenCalledWith(
       'public:programs',
       'public:latest-tracks',
+      'public:listens:stats',
+      'admin:analytics',
       'public:program:p1'
     );
   });
@@ -191,6 +195,8 @@ describe('POST /api/public/tracks/:id/like', () => {
     expect(cache.del).toHaveBeenCalledWith(
       'public:programs',
       'public:latest-tracks',
+      'public:listens:stats',
+      'admin:analytics',
       'public:program:p1'
     );
     // A SCAN over `public:*` on a user-triggered path is what this replaced.
@@ -249,15 +255,48 @@ describe('POST /api/public/tracks/:id/listen', () => {
   });
 
   it('records the listen when the fingerprint is present', async () => {
-    db.queryOne.mockResolvedValue({ id: 't1', program_id: 'p1' });
+    // First lookup is the track, the second is the dedup check finding nothing.
+    db.queryOne
+      .mockResolvedValueOnce({ id: 't1', program_id: 'p1' })
+      .mockResolvedValueOnce(undefined);
 
     const res = await request(app)
       .post('/api/public/tracks/t1/listen')
       .set('x-client-fingerprint', FINGERPRINT);
 
     expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true, counted: true });
     const insert = db.runSQL.mock.calls.find((c) => /INSERT INTO listens/.test(c[0] as string));
     expect(insert?.[1]?.slice(1)).toEqual(['t1', 'p1', FINGERPRINT]);
+  });
+
+  // The header comment promised listen dedup that did not exist: every replay
+  // inserted another row and inflated the play counts analytics reports.
+  it('does not record a second listen from the same listener inside the window', async () => {
+    db.queryOne
+      .mockResolvedValueOnce({ id: 't1', program_id: 'p1' })
+      .mockResolvedValueOnce({ id: 'prior-listen' });
+
+    const res = await request(app)
+      .post('/api/public/tracks/t1/listen')
+      .set('x-client-fingerprint', FINGERPRINT);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true, counted: false });
+    expect(db.runSQL).not.toHaveBeenCalled();
+  });
+
+  it('still counts a different listener on the same track', async () => {
+    db.queryOne
+      .mockResolvedValueOnce({ id: 't1', program_id: 'p1' })
+      .mockResolvedValueOnce(undefined);
+
+    await request(app)
+      .post('/api/public/tracks/t1/listen')
+      .set('x-client-fingerprint', 'fp_someone_else_0001');
+
+    const insert = db.runSQL.mock.calls.find((c) => /INSERT INTO listens/.test(c[0] as string));
+    expect(insert?.[1]?.slice(1)).toEqual(['t1', 'p1', 'fp_someone_else_0001']);
   });
 
   it('404s for a track that does not exist', async () => {
@@ -273,7 +312,9 @@ describe('POST /api/public/tracks/:id/listen', () => {
   // A listen changes no cached payload, so flushing the cache here would
   // defeat caching under exactly the streaming load it exists to absorb.
   it('does not invalidate the cache', async () => {
-    db.queryOne.mockResolvedValue({ id: 't1', program_id: 'p1' });
+    db.queryOne
+      .mockResolvedValueOnce({ id: 't1', program_id: 'p1' })
+      .mockResolvedValueOnce(undefined);
 
     await request(app)
       .post('/api/public/tracks/t1/listen')
