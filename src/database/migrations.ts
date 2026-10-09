@@ -125,6 +125,88 @@ const CREATE_TABLES: Migration[] = [
       `);
     },
   },
+  {
+    name: '008_create_leaders',
+    up: async (conn) => {
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS leaders (
+          id VARCHAR(36) PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          title VARCHAR(255) NOT NULL,
+          quote VARCHAR(500),
+          role_label VARCHAR(255),
+          photo VARCHAR(255),
+          sort_order INT NOT NULL DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      `);
+    },
+  },
+  {
+    name: '009_create_albums',
+    up: async (conn) => {
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS albums (
+          id VARCHAR(36) PRIMARY KEY,
+          title VARCHAR(255) NOT NULL,
+          description VARCHAR(500),
+          created_by VARCHAR(36) NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      `);
+    },
+  },
+  {
+    name: '010_create_album_photos',
+    up: async (conn) => {
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS album_photos (
+          id VARCHAR(36) PRIMARY KEY,
+          album_id VARCHAR(36) NOT NULL,
+          caption VARCHAR(500),
+          file_name VARCHAR(255) NOT NULL,
+          sort_order INT NOT NULL DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (album_id) REFERENCES albums(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      `);
+    },
+  },
+  {
+    name: '011_create_announcements',
+    up: async (conn) => {
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS announcements (
+          id VARCHAR(36) PRIMARY KEY,
+          title VARCHAR(255) NOT NULL,
+          body TEXT,
+          pinned TINYINT(1) NOT NULL DEFAULT 0,
+          created_by VARCHAR(36) NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      `);
+    },
+  },
+  {
+    name: '012_create_events',
+    up: async (conn) => {
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS events (
+          id VARCHAR(36) PRIMARY KEY,
+          title VARCHAR(255) NOT NULL,
+          description TEXT,
+          location VARCHAR(255),
+          starts_at DATETIME NOT NULL,
+          ends_at DATETIME,
+          created_by VARCHAR(36) NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      `);
+    },
+  },
 ];
 
 const CREATE_INDEXES: Migration[] = [
@@ -142,6 +224,10 @@ const CREATE_INDEXES: Migration[] = [
   'CREATE INDEX idx_listens_track ON listens(track_id)',
   'CREATE INDEX idx_listens_program ON listens(program_id)',
   'CREATE INDEX idx_listens_created ON listens(created_at DESC)',
+  'CREATE INDEX idx_leaders_sort ON leaders(sort_order, created_at)',
+  'CREATE INDEX idx_album_photos_album ON album_photos(album_id, sort_order)',
+  'CREATE INDEX idx_announcements_feed ON announcements(pinned DESC, created_at DESC)',
+  'CREATE INDEX idx_events_starts ON events(starts_at DESC)',
 ].map((sql) => ({
   name: `index:${sql.split(' ')[2]}`,
   up: async (conn: PoolConnection) => {

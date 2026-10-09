@@ -21,3 +21,22 @@ export function programReadCacheKeys(programId?: string): string[] {
     ...(programId ? [`public:program:${programId}`] : []),
   ];
 }
+
+/**
+ * Keys for the site-content reads (leaders, albums, announcements, events).
+ * Called with no argument it returns the whole set — useful when a write's
+ * blast radius is unclear — and with a resource name it returns just that
+ * resource's key, which is what every route write does so one edit never
+ * flushes the other three caches.
+ */
+export function siteReadCacheKeys(
+  resource?: 'leaders' | 'albums' | 'announcements' | 'events'
+): string[] {
+  const keys = {
+    leaders: 'public:site:leaders',
+    albums: 'public:site:albums',
+    announcements: 'public:site:announcements',
+    events: 'public:site:events',
+  } as const;
+  return resource ? [keys[resource]] : Object.values(keys);
+}

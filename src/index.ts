@@ -16,13 +16,17 @@ import trackRoutes from './routes/tracks';
 import publicRoutes from './routes/public';
 import analyticsRoutes from './routes/analytics';
 import contactRoutes from './routes/contact';
+import siteRoutes from './routes/site';
 
 import { generalLimiter, browseLimiter, authLimiter } from './middleware/rateLimit';
 
 dotenv.config();
 
 const UPLOADS_ROOT = path.resolve(process.cwd(), 'uploads');
-const UPLOAD_TYPES = ['tracks', 'covers'] as const;
+// Upload directories the /api/uploads route will serve. Each entry is one
+// subdirectory of ./uploads; the filenames are UUIDs, so the type segment is
+// the only part of the URL that carries meaning.
+const UPLOAD_TYPES = ['tracks', 'covers', 'leaders', 'albums'] as const;
 
 const MIME_TYPES: Record<string, string> = {
   '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
@@ -306,6 +310,7 @@ export function createApp() {
   app.use('/api/auth', authRoutes);
   app.use('/api/programs', programRoutes);
   app.use('/api/tracks', trackRoutes);
+  app.use('/api/site', siteRoutes);
   app.use('/api/public', browseLimiter, publicRoutes);
   app.use('/api/analytics', analyticsRoutes);
   app.use('/api/contact', contactRoutes);
