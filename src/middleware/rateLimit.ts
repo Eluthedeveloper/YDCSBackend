@@ -56,6 +56,27 @@ export const writeLimiter = limiter({
   message: 'Write limit reached, try again later.',
 });
 
+// File uploads after a successful login. Higher than writeLimiter because a
+// bulk admin session legitimately pushes hundreds of small image/track
+// finalize calls per hour; the old 50/hour write cap blocked sequential bulk
+// uploads halfway through a batch.
+export const uploadLimiter = limiter({
+  prefix: 'upload',
+  windowMs: 60 * 60 * 1000,
+  max: 400,
+  message: 'Upload limit reached, try again later.',
+});
+
+// One request per 5 MB audio chunk. A 100 MB file is 20 chunks; a 50-file
+// bulk session is ~1000 chunk posts, so this has to stay well above that
+// while still bounding a runaway or abusive client.
+export const chunkLimiter = limiter({
+  prefix: 'chunk',
+  windowMs: 60 * 60 * 1000,
+  max: 3000,
+  message: 'Upload limit reached, try again later.',
+});
+
 export const interactionLimiter = limiter({
   prefix: 'interaction',
   windowMs: 15 * 60 * 1000,

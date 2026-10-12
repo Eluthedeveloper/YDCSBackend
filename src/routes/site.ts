@@ -6,7 +6,7 @@ import fs from 'fs/promises';
 import fsSync from 'fs';
 import { queryAll, queryOne, runSQL, withTransaction } from '../database/schema';
 import { AuthRequest, authenticate, requireSuperAdmin, requireAdmin } from '../middleware/auth';
-import { browseLimiter, writeLimiter } from '../middleware/rateLimit';
+import { browseLimiter, writeLimiter, uploadLimiter } from '../middleware/rateLimit';
 import { cacheGet, cacheSet, cacheDelete } from '../cache/redis';
 import { siteReadCacheKeys } from '../lib/cacheKeys';
 import { singleString } from '../lib/validate';
@@ -258,7 +258,7 @@ router.put('/leaders/reorder', writeLimiter, authenticate, requireAdmin, asyncHa
   res.json({ message: 'Order updated' });
 }));
 
-router.post('/leaders', writeLimiter, authenticate, requireAdmin, leaderUpload.single('photo'), asyncHandler(async (req: AuthRequest, res: Response) => {
+router.post('/leaders', authenticate, requireAdmin, uploadLimiter, leaderUpload.single('photo'), asyncHandler(async (req: AuthRequest, res: Response) => {
   // Every rejection below has to delete the photo multer already wrote,
   // otherwise each failed validation leaks the uploaded file.
   const invalid = (error: string) => {
@@ -314,7 +314,7 @@ router.post('/leaders', writeLimiter, authenticate, requireAdmin, leaderUpload.s
   });
 }));
 
-router.put('/leaders/:id', writeLimiter, authenticate, requireAdmin, leaderUpload.single('photo'), asyncHandler(async (req: AuthRequest, res: Response) => {
+router.put('/leaders/:id', authenticate, requireAdmin, uploadLimiter, leaderUpload.single('photo'), asyncHandler(async (req: AuthRequest, res: Response) => {
   const leader = await queryOne<LeaderRow>('SELECT * FROM leaders WHERE id = ?', [req.params.id]);
   if (!leader) {
     removeUpload('leaders', req.file?.filename);
@@ -448,7 +448,7 @@ router.delete('/albums/:id', writeLimiter, authenticate, requireSuperAdmin, asyn
   res.json({ message: 'Album deleted' });
 }));
 
-router.post('/albums/:id/photos', writeLimiter, authenticate, requireAdmin, albumUpload.array('photos', MAX_ALBUM_FILES), asyncHandler(async (req: AuthRequest, res: Response) => {
+router.post('/albums/:id/photos', authenticate, requireAdmin, uploadLimiter, albumUpload.array('photos', MAX_ALBUM_FILES), asyncHandler(async (req: AuthRequest, res: Response) => {
   // Captured immediately: multer has already written every file by the time
   // the handler runs, so every early return has to delete them or a rejected
   // batch leaks up to 30 images.

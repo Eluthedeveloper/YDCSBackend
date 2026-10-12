@@ -161,7 +161,7 @@ router.post('/', contactLimiter, asyncHandler(async (req, res: Response) => {
   const safeMessage = escapeHtml(message).replace(/\n/g, '<br />');
 
 
-  const CONTACT_PHONE = process.env.CONTACT_PHONE || '+251 XXX XXX XXX';
+  const CONTACT_PHONE = process.env.CONTACT_PHONE || '+251 11 321 0134';
 
   try {
     // --- Admin notification email ---
@@ -221,12 +221,6 @@ router.post('/', contactLimiter, asyncHandler(async (req, res: Response) => {
         callUs: 'Bilbila fedhitanii? Nutti bilbilaa',
       },
     };
-
-    // `Object.hasOwn` rather than `confirmEmail[lang] ?? confirmEmail.en`: `lang`
-    // is unvalidated, so `?lang=constructor` resolves up the prototype chain,
-    // the nullish fallback never fires, and every `c.*` reads undefined — the
-    // guest gets a confirmation mail with no subject and the literal text
-    // "undefined" throughout.
     const c = (Object.prototype.hasOwnProperty.call(confirmEmail, lang) ? confirmEmail[lang] : confirmEmail.en)!;
 
     const userBody = `
@@ -248,10 +242,6 @@ router.post('/', contactLimiter, asyncHandler(async (req, res: Response) => {
           📞 ${CONTACT_PHONE}
         </a>
       </div>`;
-
-    // The admin copy above is the one that matters. If the guest's confirmation
-    // bounces the message still reached the church, so report success instead
-    // of telling the sender their message was lost.
     try {
       await transporter.sendMail({
         from: `"${process.env.SMTP_FROM_NAME || 'YDCS Radio'}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,

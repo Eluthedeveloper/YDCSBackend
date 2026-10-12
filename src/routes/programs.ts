@@ -5,7 +5,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import { queryAll, queryOne, runSQL } from '../database/schema';
 import { AuthRequest, authenticate, requireSuperAdmin, requireAdmin } from '../middleware/auth';
-import { writeLimiter } from '../middleware/rateLimit';
+import { writeLimiter, uploadLimiter } from '../middleware/rateLimit';
 import { cacheDelete } from '../cache/redis';
 import { programReadCacheKeys } from '../lib/cacheKeys';
 import { singleString } from '../lib/validate';
@@ -128,7 +128,7 @@ router.get('/:id', authenticate, requireAdmin, asyncHandler(async (req, res: Res
   res.json({ ...program, tracks });
 }));
 
-router.post('/', writeLimiter, authenticate, requireAdmin, uploadCover.single('cover_image'), asyncHandler(async (req: AuthRequest, res: Response) => {
+router.post('/', authenticate, requireAdmin, uploadLimiter, uploadCover.single('cover_image'), asyncHandler(async (req: AuthRequest, res: Response) => {
   try {
     const { title, description } = req.body ?? {};
 
@@ -164,7 +164,7 @@ router.post('/', writeLimiter, authenticate, requireAdmin, uploadCover.single('c
   }
 }));
 
-router.put('/:id', writeLimiter, authenticate, requireAdmin, uploadCover.single('cover_image'), asyncHandler(async (req: AuthRequest, res: Response) => {
+router.put('/:id', authenticate, requireAdmin, uploadLimiter, uploadCover.single('cover_image'), asyncHandler(async (req: AuthRequest, res: Response) => {
   const program = await queryOne<ProgramRow>('SELECT * FROM programs WHERE id = ?', [req.params.id]);
   if (!program) {
     removeCover(req.file?.filename);

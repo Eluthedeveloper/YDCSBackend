@@ -1,12 +1,13 @@
-import { Router, Response } from 'express';
+import { Router, Response, raw } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import type mysql from 'mysql2/promise';
 import { queryAll, queryOne, runSQL, getPool, withTransaction } from '../database/schema';
 import { AuthRequest, authenticate, requireSuperAdmin, requireAdmin } from '../middleware/auth';
-import { writeLimiter } from '../middleware/rateLimit';
+import { writeLimiter, uploadLimiter, chunkLimiter } from '../middleware/rateLimit';
 import { cacheDelete } from '../cache/redis';
 import { programReadCacheKeys } from '../lib/cacheKeys';
 import { singleString, coerceDuration } from '../lib/validate';
@@ -65,6 +66,28 @@ interface TrackRow {
 }
 
 const UPLOADS_ROOT = path.resolve(process.cwd(), 'uploads');
+const TMP_ROOT = path.join(UPLOADS_ROOT, 'tmp');
+const TRACKS_ROOT = path.join(UPLOADS_ROOT, 'tracks');
+
+// Fixed chunk size the client must use. 5 MB stays under nginx's 200 MB body
+// cap with huge headroom, finishes quickly on a slow uplink, and keeps each
+// request well under any reverse-proxy idle timeout.
+const CHUNK_SIZE = 5 * 1024 * 1024;
+const MAX_AUDIO_BYTES = 100 * 1024 * 1024;
+// upload_id is a server-generated UUID; anything else never touches the FS.
+const UPLOAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+const ALLOWED_AUDIO_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac'];
+
+interface ChunkUploadMeta {
+  original_name: string;
+  mime_type: string;
+  size: number;
+  chunk_size: number;
+  chunk_count: number;
+  created_at: string;
+}
 
 // Best-effort deletion of files multer already wrote to disk. Used on every
 // path where a request fails after the bytes landed, so failed uploads don't
@@ -75,6 +98,95 @@ function cleanupFiles(files?: Array<Express.Multer.File | undefined | null> | nu
       fs.unlink(path.join(UPLOADS_ROOT, 'tracks', file.filename)).catch(() => {});
     }
   }
+}
+
+function tmpDirFor(uploadId: string): string {
+  return path.join(TMP_ROOT, uploadId);
+}
+
+async function readChunkMeta(uploadId: string): Promise<ChunkUploadMeta | null> {
+  try {
+    const rawMeta = await fs.readFile(path.join(tmpDirFor(uploadId), 'meta.json'), 'utf8');
+    const meta = JSON.parse(rawMeta) as ChunkUploadMeta;
+    if (
+      typeof meta?.size !== 'number' ||
+      typeof meta?.chunk_count !== 'number' ||
+      typeof meta?.chunk_size !== 'number' ||
+      !Number.isInteger(meta.size) ||
+      !Number.isInteger(meta.chunk_count) ||
+      meta.size <= 0 ||
+      meta.chunk_count <= 0
+    ) {
+      return null;
+    }
+    return meta;
+  } catch {
+    return null;
+  }
+}
+
+async function listReceivedChunks(uploadId: string): Promise<number[]> {
+  try {
+    const entries = await fs.readdir(tmpDirFor(uploadId));
+    return entries
+      .filter((entry) => /^\d+\.part$/.test(entry))
+      .map((entry) => Number.parseInt(entry, 10))
+      .filter((n) => Number.isInteger(n) && n >= 0)
+      .sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
+}
+
+/** Removes tmp upload dirs older than TMP_MAX_AGE_MS so abandoned sessions cannot fill the disk. */
+async function purgeExpiredTmpUploads(): Promise<void> {
+  try {
+    const entries = await fs.readdir(TMP_ROOT, { withFileTypes: true });
+    const now = Date.now();
+    await Promise.all(
+      entries.map(async (entry) => {
+        if (!entry.isDirectory() || !UPLOAD_ID_RE.test(entry.name)) return;
+        const dir = path.join(TMP_ROOT, entry.name);
+        try {
+          const st = await fs.stat(dir);
+          if (now - st.mtimeMs > TMP_MAX_AGE_MS) {
+            await fs.rm(dir, { recursive: true, force: true });
+          }
+        } catch {
+          // Already gone or unreadable — nothing to purge.
+        }
+      })
+    );
+  } catch {
+    // TMP_ROOT may not exist on a fresh install.
+  }
+}
+
+async function removeTmpUpload(uploadId: string): Promise<void> {
+  await fs.rm(tmpDirFor(uploadId), { recursive: true, force: true }).catch(() => {});
+}
+
+/** Streams every chunk, in order, into destPath. */
+async function assembleChunks(uploadId: string, meta: ChunkUploadMeta, destPath: string): Promise<void> {
+  for (let i = 0; i < meta.chunk_count; i++) {
+    const chunkPath = path.join(tmpDirFor(uploadId), `${i}.part`);
+    // `i === 0` truncates; later chunks append. createReadStream + pipe keeps
+    // peak memory at one chunk even for a 100 MB file.
+    const out = fsSync.createWriteStream(destPath, { flags: i === 0 ? 'w' : 'a' });
+    await new Promise<void>((resolve, reject) => {
+      const input = fsSync.createReadStream(chunkPath);
+      input.on('error', reject);
+      out.on('error', reject);
+      out.on('finish', () => resolve());
+      input.pipe(out);
+    });
+  }
+}
+
+function expectedChunkSize(meta: ChunkUploadMeta, index: number): number {
+  if (index < meta.chunk_count - 1) return meta.chunk_size;
+  const remainder = meta.size % meta.chunk_size;
+  return remainder === 0 ? meta.chunk_size : remainder;
 }
 
 const trackStorage = multer.diskStorage({
@@ -117,7 +229,7 @@ router.get('/program/:programId', authenticate, requireAdmin, asyncHandler(async
   res.json(tracks);
 }));
 
-router.post('/', writeLimiter, authenticate, requireAdmin, uploadTrack.single('audio_file'), asyncHandler(async (req: AuthRequest, res: Response) => {
+router.post('/', authenticate, requireAdmin, uploadLimiter, uploadTrack.single('audio_file'), asyncHandler(async (req: AuthRequest, res: Response) => {
   const { title, artist, album, program_id, track_type } = req.body ?? {};
 
   // Every branch below has to release req.file, so validation failures are
@@ -186,7 +298,7 @@ router.post('/', writeLimiter, authenticate, requireAdmin, uploadTrack.single('a
   res.status(201).json({ id, title: cleanTitle, artist, album, file_path: req.file.filename, program_id: cleanProgramId, track_type: cleanTrackType, sort_order: sortOrder });
 }));
 
-router.post('/bulk', writeLimiter, authenticate, requireAdmin, uploadTrack.array('audio_files', MAX_BULK_FILES), asyncHandler(async (req: AuthRequest, res: Response) => {
+router.post('/bulk', authenticate, requireAdmin, uploadLimiter, uploadTrack.array('audio_files', MAX_BULK_FILES), asyncHandler(async (req: AuthRequest, res: Response) => {
   // Captured immediately: multer has already written every file to disk by the
   // time the handler runs, so every early return below must delete them or the
   // rejected upload leaks up to 50 x 100MB.
@@ -264,6 +376,211 @@ router.post('/bulk', writeLimiter, authenticate, requireAdmin, uploadTrack.array
     console.error('Error bulk uploading tracks:', err);
     res.status(500).json({ error: 'Failed to upload tracks' });
   }
+}));
+
+// ---------------------------------------------------------------------------
+// Chunked, resumable upload.
+//
+// A single 100 MB POST from a slow uplink dies on any network blip and has to
+// restart from zero. The client splits the file into fixed-size chunks, and a
+// drop only costs that one chunk. `init` reserves a tmp dir, `chunk` writes one
+// part (idempotent — a retry overwrites), `status` lists parts already on disk
+// so a page reload can resume, and `finalize` concatenates and inserts the row.
+// ---------------------------------------------------------------------------
+
+router.post('/upload/init', authenticate, requireAdmin, uploadLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
+  // Fire-and-forget: a stale tmp dir must never fail a fresh init.
+  void purgeExpiredTmpUploads();
+
+  const originalName = singleString(req.body?.original_name);
+  const size = Number(req.body?.size);
+  const mimeType = singleString(req.body?.mime_type) || 'audio/mpeg';
+
+  if (!originalName) return res.status(400).json({ error: 'original_name is required' });
+  if (!Number.isInteger(size) || size <= 0 || size > MAX_AUDIO_BYTES) {
+    return res.status(400).json({ error: `File size must be between 1 and ${Math.floor(MAX_AUDIO_BYTES / (1024 * 1024))} MB` });
+  }
+
+  const ext = path.extname(originalName).toLowerCase();
+  if (!ALLOWED_AUDIO_EXTENSIONS.includes(ext)) {
+    return res.status(400).json({ error: 'Invalid file type' });
+  }
+  if (!mimeType.startsWith('audio/') && mimeType !== 'video/mp4') {
+    return res.status(400).json({ error: 'Invalid file type' });
+  }
+
+  const uploadId = uuidv4();
+  const chunkCount = Math.ceil(size / CHUNK_SIZE);
+  const meta: ChunkUploadMeta = {
+    original_name: originalName,
+    mime_type: mimeType,
+    size,
+    chunk_size: CHUNK_SIZE,
+    chunk_count: chunkCount,
+    created_at: new Date().toISOString(),
+  };
+
+  const dir = tmpDirFor(uploadId);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, 'meta.json'), JSON.stringify(meta));
+
+  res.status(201).json({
+    upload_id: uploadId,
+    chunk_size: CHUNK_SIZE,
+    chunk_count: chunkCount,
+    received: [] as number[],
+  });
+}));
+
+router.get('/upload/status/:uploadId', authenticate, requireAdmin, uploadLimiter, asyncHandler(async (req, res: Response) => {
+  const uploadId = singleString(req.params.uploadId);
+  if (!uploadId || !UPLOAD_ID_RE.test(uploadId)) {
+    return res.status(400).json({ error: 'Invalid upload id' });
+  }
+  const meta = await readChunkMeta(uploadId);
+  if (!meta) return res.status(404).json({ error: 'Upload session not found or expired' });
+  const received = await listReceivedChunks(uploadId);
+  res.json({ upload_id: uploadId, chunk_count: meta.chunk_count, received });
+}));
+
+router.post(
+  '/upload/chunk/:uploadId/:index',
+  authenticate,
+  requireAdmin,
+  chunkLimiter,
+  // Raw octet-stream avoids multipart framing entirely; the limit is one
+  // chunk plus a little slack so a wrong-sized body fails here, not mid-write.
+  raw({ type: 'application/octet-stream', limit: CHUNK_SIZE + 1024 * 1024 }),
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    const uploadId = singleString(req.params.uploadId);
+    if (!uploadId || !UPLOAD_ID_RE.test(uploadId)) {
+      return res.status(400).json({ error: 'Invalid upload id' });
+    }
+
+    const index = Number(req.params.index);
+    if (!Number.isInteger(index) || index < 0) {
+      return res.status(400).json({ error: 'Invalid chunk index' });
+    }
+
+    const meta = await readChunkMeta(uploadId);
+    if (!meta) return res.status(404).json({ error: 'Upload session not found or expired' });
+    if (index >= meta.chunk_count) {
+      return res.status(400).json({ error: 'Chunk index out of range' });
+    }
+
+    const body = req.body as Buffer;
+    if (!Buffer.isBuffer(body) || body.length === 0) {
+      return res.status(400).json({ error: 'Chunk body required' });
+    }
+
+    const expected = expectedChunkSize(meta, index);
+    if (body.length !== expected) {
+      return res.status(400).json({ error: `Chunk size mismatch: expected ${expected} bytes, got ${body.length}` });
+    }
+
+    await fs.writeFile(path.join(tmpDirFor(uploadId), `${index}.part`), body);
+    const received = await listReceivedChunks(uploadId);
+    res.json({ received_index: index, received, complete: received.length >= meta.chunk_count });
+  })
+);
+
+router.post('/upload/finalize', authenticate, requireAdmin, uploadLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
+  const uploadId = singleString(req.body?.upload_id);
+  if (!uploadId || !UPLOAD_ID_RE.test(uploadId)) {
+    return res.status(400).json({ error: 'Invalid upload id' });
+  }
+
+  const meta = await readChunkMeta(uploadId);
+  if (!meta) return res.status(404).json({ error: 'Upload session not found or expired' });
+
+  const received = await listReceivedChunks(uploadId);
+  const missing: number[] = [];
+  for (let i = 0; i < meta.chunk_count; i++) {
+    if (!received.includes(i)) missing.push(i);
+  }
+  if (missing.length > 0) {
+    return res.status(400).json({ error: `Missing chunks: ${missing.join(', ')}`, missing });
+  }
+
+  const cleanTitle = singleString(req.body?.title);
+  if (!cleanTitle) return res.status(400).json({ error: 'Title is required' });
+  if (cleanTitle.length > MAX_TITLE) {
+    return res.status(400).json({ error: `Title must be ${MAX_TITLE} characters or fewer` });
+  }
+
+  const cleanArtist = singleString(req.body?.artist);
+  const cleanAlbum = singleString(req.body?.album);
+  if (cleanArtist && cleanArtist.length > MAX_ARTIST) {
+    return res.status(400).json({ error: `Artist must be ${MAX_ARTIST} characters or fewer` });
+  }
+  if (cleanAlbum && cleanAlbum.length > MAX_ALBUM) {
+    return res.status(400).json({ error: `Album must be ${MAX_ALBUM} characters or fewer` });
+  }
+
+  const cleanProgramId = singleString(req.body?.program_id);
+  if (!cleanProgramId) return res.status(400).json({ error: 'Program ID is required' });
+
+  const cleanTrackType = singleString(req.body?.track_type) || 'episode';
+  if (!TRACK_TYPES.includes(cleanTrackType as TrackType)) {
+    return res.status(400).json({ error: 'Invalid track type' });
+  }
+
+  const duration = coerceDuration(req.body?.duration, 0);
+  if (duration === null) return res.status(400).json({ error: 'Invalid duration' });
+
+  const program = await queryOne('SELECT id FROM programs WHERE id = ?', [cleanProgramId]);
+  if (!program) {
+    await removeTmpUpload(uploadId);
+    return res.status(404).json({ error: 'Program not found' });
+  }
+
+  await fs.mkdir(TRACKS_ROOT, { recursive: true });
+  const ext = path.extname(meta.original_name).toLowerCase() || '.mp3';
+  const filename = `${uuidv4()}${ext}`;
+  const destPath = path.join(TRACKS_ROOT, filename);
+
+  try {
+    await assembleChunks(uploadId, meta, destPath);
+    const st = await fs.stat(destPath);
+    if (st.size !== meta.size) {
+      await fs.unlink(destPath).catch(() => {});
+      return res.status(500).json({ error: 'Assembled file size does not match the declared size' });
+    }
+  } catch (err) {
+    await fs.unlink(destPath).catch(() => {});
+    console.error('Error assembling chunked upload:', err);
+    return res.status(500).json({ error: 'Failed to assemble uploaded file' });
+  }
+
+  const id = uuidv4();
+  let sortOrder: number;
+  try {
+    sortOrder = await withTransaction(async (conn) => {
+      const next = await reserveSortOrder(conn, cleanProgramId);
+      await conn.execute(
+        'INSERT INTO tracks (id, title, artist, album, duration, file_path, program_id, track_type, sort_order, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [id, cleanTitle, cleanArtist || null, cleanAlbum || null, duration, filename, cleanProgramId, cleanTrackType, next, req.user!.id]
+      );
+      return next;
+    });
+  } catch (err) {
+    await fs.unlink(destPath).catch(() => {});
+    await removeTmpUpload(uploadId);
+    throw err;
+  }
+
+  await removeTmpUpload(uploadId);
+  await cacheDelete(...programReadCacheKeys(cleanProgramId));
+  res.status(201).json({
+    id,
+    title: cleanTitle,
+    artist: cleanArtist || null,
+    album: cleanAlbum || null,
+    file_path: filename,
+    program_id: cleanProgramId,
+    track_type: cleanTrackType,
+    sort_order: sortOrder,
+  });
 }));
 
 router.put('/:id', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {

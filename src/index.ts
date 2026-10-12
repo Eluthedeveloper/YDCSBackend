@@ -344,6 +344,11 @@ export function createApp() {
         }
         return res.status(400).json({ error: `Upload error: ${err.message}` });
       }
+      // express.raw / express.json body-parser rejects. Without this a chunk
+      // over the limit surfaces as a generic 500 instead of a clear 413.
+      if (err && typeof err.status === 'number' && err.status === 413) {
+        return res.status(413).json({ error: 'Request body too large' });
+      }
       if (err && err.message === 'Invalid file type') {
         return res.status(400).json({ error: err.message });
       }
