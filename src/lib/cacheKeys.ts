@@ -23,20 +23,32 @@ export function programReadCacheKeys(programId?: string): string[] {
 }
 
 /**
- * Keys for the site-content reads (leaders, albums, announcements, events).
- * Called with no argument it returns the whole set — useful when a write's
- * blast radius is unclear — and with a resource name it returns just that
- * resource's key, which is what every route write does so one edit never
- * flushes the other three caches.
+ * Keys for the site-content reads (leaders, albums, announcements, events,
+ * blog). Called with no argument it returns the whole set — useful when a
+ * write's blast radius is unclear — and with a resource name it returns just
+ * that resource's key, which is what every route write does so one edit never
+ * flushes the other caches.
  */
 export function siteReadCacheKeys(
-  resource?: 'leaders' | 'albums' | 'announcements' | 'events'
+  resource?: 'leaders' | 'albums' | 'announcements' | 'events' | 'blog' | 'whats-new'
 ): string[] {
   const keys = {
     leaders: 'public:site:leaders',
     albums: 'public:site:albums',
     announcements: 'public:site:announcements',
     events: 'public:site:events',
+    blog: 'public:site:blog',
+    'whats-new': 'public:site:whats-new',
   } as const;
   return resource ? [keys[resource]] : Object.values(keys);
+}
+
+/**
+ * Keys a write to the feed-shaped resources (announcements, events, blog)
+ * has to drop: its own list plus the merged "what's new" feed the
+ * notification bell polls. Forgetting the second one is how a new post ends
+ * up invisible to the bell for five minutes while the page already shows it.
+ */
+export function feedReadCacheKeys(resource: 'announcements' | 'events' | 'blog'): string[] {
+  return [...siteReadCacheKeys(resource), ...siteReadCacheKeys('whats-new')];
 }

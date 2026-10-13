@@ -26,7 +26,7 @@ const UPLOADS_ROOT = path.resolve(process.cwd(), 'uploads');
 // Upload directories the /api/uploads route will serve. Each entry is one
 // subdirectory of ./uploads; the filenames are UUIDs, so the type segment is
 // the only part of the URL that carries meaning.
-const UPLOAD_TYPES = ['tracks', 'covers', 'leaders', 'albums'] as const;
+const UPLOAD_TYPES = ['tracks', 'covers', 'leaders', 'albums', 'blogs'] as const;
 
 const MIME_TYPES: Record<string, string> = {
   '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
@@ -98,12 +98,22 @@ export function createApp() {
 
   const PORT = Number(process.env.PORT) || 5000;
 
-  // Trust one reverse proxy hop (Apache/nginx/caddy) only when explicitly
-  // configured, so rate limits and req.ip are based on the real client IP.
-  // If the server is directly reachable, keep this off: otherwise clients
-  // can spoof X-Forwarded-For to bypass every rate limiter.
-  if (process.env.TRUST_PROXY === 'true') {
-    app.set('trust proxy', 1);
+  // Trust reverse-proxy hops so rate limits and req.ip use the real client.
+  //
+  // TLS terminates in front of nginx (Cloudflare or a host panel), so the
+  // chain is client → outer proxy → nginx → backend — two hops, not one.
+  // With `trust proxy 1` Express took the last XFF entry (the outer proxy's
+  // IP) as the client, collapsing every visitor onto one shared address and
+  // exhausting generalLimiter for everyone. Accept either `true` (legacy,
+  // two hops — matches this deployment) or an explicit hop count.
+  //
+  // If the server is directly reachable with no proxy, leave this unset:
+  // otherwise clients can spoof X-Forwarded-For to bypass every limiter.
+  const trustProxy = process.env.TRUST_PROXY;
+  if (trustProxy === 'true') {
+    app.set('trust proxy', 2);
+  } else if (trustProxy && Number.isInteger(Number(trustProxy)) && Number(trustProxy) > 0) {
+    app.set('trust proxy', Number(trustProxy));
   }
 
   // Security.
@@ -152,10 +162,17 @@ export function createApp() {
     })
   );
 
-  // One general limiter for the whole API. Individual routers add stricter
-  // limiters on top (login, contact, writes) where they need to, so mounting
-  // generalLimiter again per-router just double-counted the same window.
-  app.use('/api/', generalLimiter);
+  // One general limiter for the whole API, except GET media under /api/uploads.
+  // Audio playback issues a burst of Range requests per seek; counting those
+  // against the shared window is what made production play/pause fail with
+  // 429s (media element error → isPlaying desync → pause called resume)
+  // while localhost never tripped. Writes still go through per-router limiters.
+  app.use('/api/', (req, res, next) => {
+    if (req.method === 'GET' && req.originalUrl.startsWith('/api/uploads/')) {
+      return next();
+    }
+    generalLimiter(req, res, next);
+  });
 
   console.log('Uploads directory:', UPLOADS_ROOT);
 

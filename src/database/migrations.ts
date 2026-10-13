@@ -207,6 +207,45 @@ const CREATE_TABLES: Migration[] = [
       `);
     },
   },
+  {
+    name: '013_create_blog_posts',
+    up: async (conn) => {
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS blog_posts (
+          id VARCHAR(36) PRIMARY KEY,
+          slug VARCHAR(255) UNIQUE NOT NULL,
+          title VARCHAR(255) NOT NULL,
+          excerpt VARCHAR(500),
+          body MEDIUMTEXT,
+          category VARCHAR(100),
+          cover_image VARCHAR(255),
+          published TINYINT(1) NOT NULL DEFAULT 1,
+          created_by VARCHAR(36) NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      `);
+    },
+  },
+  {
+    // Extra photos shown inside the article body. Separate rows rather than a
+    // JSON column so a single dropped photo is one DELETE, not a read-modify-
+    // write of the whole post, and so the file can be unlinked by filename.
+    name: '014_create_blog_images',
+    up: async (conn) => {
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS blog_images (
+          id VARCHAR(36) PRIMARY KEY,
+          blog_post_id VARCHAR(36) NOT NULL,
+          image VARCHAR(255) NOT NULL,
+          sort_order INT NOT NULL DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (blog_post_id) REFERENCES blog_posts(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      `);
+    },
+  },
 ];
 
 const CREATE_INDEXES: Migration[] = [
@@ -228,6 +267,10 @@ const CREATE_INDEXES: Migration[] = [
   'CREATE INDEX idx_album_photos_album ON album_photos(album_id, sort_order)',
   'CREATE INDEX idx_announcements_feed ON announcements(pinned DESC, created_at DESC)',
   'CREATE INDEX idx_events_starts ON events(starts_at DESC)',
+  'CREATE INDEX idx_blog_slug ON blog_posts(slug)',
+  'CREATE INDEX idx_blog_created ON blog_posts(created_at DESC)',
+  'CREATE INDEX idx_blog_published ON blog_posts(published, created_at DESC)',
+  'CREATE INDEX idx_blog_images_post ON blog_images(blog_post_id, sort_order)',
 ].map((sql) => ({
   name: `index:${sql.split(' ')[2]}`,
   up: async (conn: PoolConnection) => {

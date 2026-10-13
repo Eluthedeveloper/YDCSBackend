@@ -71,6 +71,14 @@ vi.mock('multer', async () => {
       req.files = multerState.files;
       next();
     },
+    // The blog routes ask for a cover and a gallery in one request; multer's
+    // real `fields()` puts them under `req.files[fieldName]`.
+    fields: () => (req: { file?: unknown; files?: unknown }, _res: unknown, next: () => void) => {
+      const cover = { filename: 'leader-uuid.jpg', originalname: 'leader.jpg', mimetype: 'image/jpeg' };
+      req.file = cover;
+      req.files = { cover: [cover], images: multerState.files };
+      next();
+    },
   });
   return {
     ...actual,
@@ -405,7 +413,9 @@ describe('DELETE /api/site permissions', () => {
       .set('Cookie', cookieFor('super_admin'));
 
     expect(res.status).toBe(200);
-    expect(cacheDelete).toHaveBeenCalledWith('public:site:announcements');
+    // The merged feed is dropped alongside the list: a post removed from the
+    // site must disappear from the notification bell on the same request.
+    expect(cacheDelete).toHaveBeenCalledWith('public:site:announcements', 'public:site:whats-new');
   });
 
   // The leader's photo is referenced only by that row; a delete that leaves the
@@ -448,5 +458,157 @@ describe('PUT /api/site/leaders/:id', () => {
 
     expect(res.status).toBe(404);
     expect(unlink).toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/site/blog', () => {
+  // The public list is the published feed; a draft left in the result set
+  // would put an unpublished post in front of every visitor.
+  it('lists only published posts, newest first, and caches them', async () => {
+    db.queryAll.mockResolvedValue([{ id: 'p1', slug: 'hello-world', title: 'Hello' }]);
+
+    const res = await request(app).get('/api/site/blog');
+
+    expect(res.status).toBe(200);
+    const sql = db.queryAll.mock.calls[0]?.[0] as string;
+    expect(sql).toContain('WHERE published = 1');
+    expect(sql).toContain('ORDER BY created_at DESC');
+    expect(cacheGet).toHaveBeenCalledWith('public:site:blog');
+    expect(cacheSet).toHaveBeenCalledWith('public:site:blog', expect.any(Array), 300);
+  });
+
+  it('serves a single post by its slug', async () => {
+    db.queryOne.mockResolvedValue({ id: 'p1', slug: 'hello-world', title: 'Hello', published: 1 });
+    db.queryAll.mockResolvedValue([{ image: 'photo-1.jpg' }]);
+
+    const res = await request(app).get('/api/site/blog/hello-world');
+
+    expect(res.status).toBe(200);
+    expect(res.body.slug).toBe('hello-world');
+    expect(res.body.images).toEqual(['photo-1.jpg']);
+  });
+
+  // The article page renders a photo grid from the same payload; without the
+  // embedded list it would need one request per image.
+  it('embeds each post with its gallery photos', async () => {
+    db.queryAll
+      .mockResolvedValueOnce([{ id: 'p1', slug: 'hello-world', title: 'Hello' }])
+      .mockResolvedValueOnce([{ image: 'photo-1.jpg' }, { image: 'photo-2.jpg' }]);
+
+    const res = await request(app).get('/api/site/blog');
+
+    expect(res.status).toBe(200);
+    expect(res.body[0].images).toEqual(['photo-1.jpg', 'photo-2.jpg']);
+    expect(db.queryAll.mock.calls[1]?.[1]).toEqual(['p1', 6]);
+  });
+
+  it('404s an unknown slug', async () => {
+    db.queryOne.mockResolvedValue(undefined);
+
+    const res = await request(app).get('/api/site/blog/missing');
+
+    expect(res.status).toBe(404);
+  });
+});
+
+describe('POST /api/site/blog', () => {
+  it('requires a session', async () => {
+    const res = await request(app).post('/api/site/blog').send({ title: 'A' });
+
+    expect(res.status).toBe(401);
+  });
+
+  it('creates a post, derives its slug, and drops the list and feed caches', async () => {
+    authThen(undefined);
+
+    const res = await request(app)
+      .post('/api/site/blog')
+      .set('Cookie', cookieFor('admin'))
+      .send({ title: 'Hello, World!', body: 'First post' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.slug).toBe('hello-world');
+    // The excerpt is derived from the body when the admin leaves it blank.
+    expect(res.body.excerpt).toBe('First post');
+    const insert = db.runSQL.mock.calls.find((c) => /INSERT INTO blog_posts/.test(c[0] as string));
+    expect(insert?.[1]).toContain('hello-world');
+    expect(cacheDelete).toHaveBeenCalledWith('public:site:blog', 'public:site:whats-new');
+  });
+
+  // Two extra photos ride along with the cover; they need their own rows and
+  // have to come back on the post the admin just made.
+  it('stores uploaded gallery photos with the new post', async () => {
+    authThen(undefined);
+
+    const res = await request(app)
+      .post('/api/site/blog')
+      .set('Cookie', cookieFor('admin'))
+      .send({ title: 'With Photos' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.images).toEqual(['photo-1.jpg', 'photo-2.jpg']);
+    const inserts = db.runSQL.mock.calls.filter((c) => /INSERT INTO blog_images/.test(c[0] as string));
+    expect(inserts).toHaveLength(2);
+    expect(inserts[0]?.[1]).toContain('photo-1.jpg');
+  });
+
+  // An edit lists the gallery filenames it wants to keep; the ones left out
+  // are rows to drop and files to unlink.
+  it('deletes gallery photos the edit dropped', async () => {
+    authThen({ id: 'p1', slug: 'hello-world', title: 'Hello', cover_image: null, published: 1 });
+    db.queryAll.mockResolvedValue([
+      { id: 'gi1', blog_post_id: 'p1', image: 'kept.jpg', sort_order: 0 },
+      { id: 'gi2', blog_post_id: 'p1', image: 'dropped.jpg', sort_order: 1 },
+    ]);
+    multerState.files = [];
+
+    const res = await request(app)
+      .put('/api/site/blog/p1')
+      .set('Cookie', cookieFor('admin'))
+      // JSON, not multipart: the mocked multer never parses a real form, so a
+      // `.field()` body would arrive empty and keep every photo.
+      .send({ keepImages: JSON.stringify(['kept.jpg']) });
+
+    expect(res.status).toBe(200);
+    expect(db.runSQL.mock.calls.some((c) => /DELETE FROM blog_images WHERE id = \?/.test(c[0] as string))).toBe(true);
+    expect(unlink).toHaveBeenCalledWith(expect.stringContaining('dropped.jpg'));
+    expect(unlink).not.toHaveBeenCalledWith(expect.stringContaining('kept.jpg'));
+  });
+
+  it('rejects a missing title and deletes the uploaded cover', async () => {
+    const res = await request(app)
+      .post('/api/site/blog')
+      .set('Cookie', cookieFor('admin'))
+      .send({ body: 'No title' });
+
+    expect(res.status).toBe(400);
+    expect(unlink).toHaveBeenCalledWith(expect.stringContaining('leader-uuid.jpg'));
+  });
+});
+
+describe('GET /api/site/whats-new', () => {
+  // The bell shows one merged list: newest first across all three tables,
+  // with the blog entry pointing at the post's public URL.
+  it('merges blogs, announcements and events newest first', async () => {
+    db.queryAll
+      .mockResolvedValueOnce([
+        { id: 'b1', slug: 'post-one', title: 'Post', excerpt: null, body: 'Body', cover_image: 'c.jpg', created_at: '2026-01-03 10:00:00' },
+      ])
+      .mockResolvedValueOnce([
+        { id: 'a1', title: 'Notice', body: 'Announcement body', created_at: '2026-01-04 10:00:00' },
+      ])
+      .mockResolvedValueOnce([
+        { id: 'e1', title: 'Event', description: 'Desc', location: 'Hall', created_at: '2026-01-05 10:00:00' },
+      ]);
+
+    const res = await request(app).get('/api/site/whats-new');
+
+    expect(res.status).toBe(200);
+    expect(res.body.map((item: { id: string }) => item.id)).toEqual(['e1', 'a1', 'b1']);
+    expect(res.body[2].url).toBe('/blog/post-one');
+    expect(res.body[2].type).toBe('blog');
+    // One minute, not the five the lists use: a new announcement should not
+    // sit invisible in the bell for a fifth of an hour.
+    expect(cacheSet).toHaveBeenCalledWith('public:site:whats-new', expect.any(Array), 60);
   });
 });

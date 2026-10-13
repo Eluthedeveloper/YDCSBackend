@@ -64,6 +64,9 @@ vi.mock('multer', async () => {
       next();
     },
     array: () => (_req: unknown, _res: unknown, next: () => void) => next(),
+    // The blog routes in site.ts register a `fields()` upload at import time;
+    // this router never uses it, so a passthrough keeps the module loadable.
+    fields: () => (_req: unknown, _res: unknown, next: () => void) => next(),
   });
   return {
     ...actual,

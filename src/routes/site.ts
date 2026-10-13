@@ -8,7 +8,7 @@ import { queryAll, queryOne, runSQL, withTransaction } from '../database/schema'
 import { AuthRequest, authenticate, requireSuperAdmin, requireAdmin } from '../middleware/auth';
 import { browseLimiter, writeLimiter, uploadLimiter } from '../middleware/rateLimit';
 import { cacheGet, cacheSet, cacheDelete } from '../cache/redis';
-import { siteReadCacheKeys } from '../lib/cacheKeys';
+import { siteReadCacheKeys, feedReadCacheKeys } from '../lib/cacheKeys';
 import { singleString } from '../lib/validate';
 import { asyncHandler } from '../lib/asyncHandler';
 
@@ -37,6 +37,14 @@ const MAX_DESCRIPTION = 5000;
 const MAX_LOCATION = 255;
 const MAX_BODY = 10000;
 const MAX_CAPTION = 500;
+const MAX_EXCERPT = 500;
+const MAX_CATEGORY = 100;
+// MEDIUMTEXT would hold far more, but a 50k-character wall of text is past
+// what anyone reads on a card-driven blog; the cap keeps posts scannable.
+const MAX_BLOG_BODY = 50000;
+// Extra photos inside an article. Six is the point where a grid still fits
+// one screen on a phone without turning the post into a gallery page.
+const MAX_BLOG_IMAGES = 6;
 
 // Bound on rows any list returns: enough for a homepage feed, small enough
 // that one request can never materialise an unbounded table.
@@ -47,6 +55,11 @@ const MAX_PHOTOS_PER_ALBUM = 500;
 const MAX_PHOTO_BYTES = 15 * 1024 * 1024;
 const MAX_ALBUM_FILES = 30;
 const MAX_REORDER_IDS = 100;
+// Rows pulled from each table to build the feed, and how many merged entries
+// survive the sort. Both are small on purpose: the bell renders a dropdown,
+// not a page.
+const FEED_ROWS = 8;
+const FEED_LIMIT = 12;
 
 const ALLOWED_IMAGE_EXTENSIONS = ['.jpeg', '.jpg', '.png', '.webp'];
 const ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
@@ -55,6 +68,12 @@ const LEADERS_KEY = 'public:site:leaders';
 const ALBUMS_KEY = 'public:site:albums';
 const ANNOUNCEMENTS_KEY = 'public:site:announcements';
 const EVENTS_KEY = 'public:site:events';
+const BLOG_KEY = 'public:site:blog';
+const WHATS_NEW_KEY = 'public:site:whats-new';
+// Short enough that a freshly posted announcement reaches the bell within a
+// minute, long enough that the polling tab does not turn every 60 s into a
+// three-way query.
+const WHATS_NEW_TTL = 60;
 
 interface LeaderRow {
   id: string;
@@ -96,6 +115,39 @@ interface EventRow {
   ends_at: string | null;
 }
 
+interface BlogRow {
+  id: string;
+  slug: string;
+  title: string;
+  excerpt: string | null;
+  body: string | null;
+  category: string | null;
+  cover_image: string | null;
+  published: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** One extra photo attached to a blog post, after the cover. */
+interface BlogImageRow {
+  id: string;
+  blog_post_id: string;
+  image: string;
+  sort_order: number;
+  created_at?: string;
+}
+
+/** One row of the merged "what's new" feed the notification bell polls. */
+interface WhatsNewItem {
+  id: string;
+  type: 'blog' | 'announcement' | 'event';
+  title: string;
+  summary: string | null;
+  image: string | null;
+  url: string;
+  published_at: string;
+}
+
 /**
  * Image upload into `uploads/<dir>`.
  *
@@ -131,6 +183,9 @@ function imageUpload(dir: string, maxFiles = 1) {
 
 const leaderUpload = imageUpload('leaders');
 const albumUpload = imageUpload('albums', MAX_ALBUM_FILES);
+// One multer instance serves both fields: the cover is a single file and the
+// gallery is an array, and they share the destination, size cap and filter.
+const blogUpload = imageUpload('blogs', 1 + MAX_BLOG_IMAGES);
 
 /** Best-effort removal of a file multer already wrote to disk. */
 function removeUpload(dir: string, filename?: string | null) {
@@ -172,6 +227,53 @@ async function cachedList<T>(key: string, load: () => Promise<T[]>): Promise<T[]
   return rows;
 }
 
+/**
+ * URL-safe form of a title for the post's permanent link.
+ *
+ * Diacritics are stripped rather than dropped so an Amharic-free English
+ * title keeps its accents, and a title that is nothing but punctuation still
+ * yields a usable slug instead of an empty string that the UNIQUE index
+ * would reject on the second such post.
+ */
+function slugify(value: string): string {
+  const base = value
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 180);
+  return base || 'post';
+}
+
+/** A slug no other row holds, so slugs stay unique without a retry loop at read time. */
+async function uniqueSlug(title: string, excludeId?: string): Promise<string> {
+  const base = slugify(title);
+  let candidate = base;
+  for (let suffix = 2; suffix < 50; suffix++) {
+    const clash = await queryOne<{ id: string }>('SELECT id FROM blog_posts WHERE slug = ?', [candidate]);
+    if (!clash || clash.id === excludeId) return candidate;
+    candidate = `${base}-${suffix}`;
+  }
+  return `${base}-${uuidv4().slice(0, 8)}`;
+}
+
+/** Fallback excerpt when an admin left the field blank. */
+function deriveExcerpt(post: { excerpt?: string | null; body?: string | null }): string | null {
+  const explicit = (post.excerpt ?? '').trim();
+  if (explicit) return explicit;
+  const text = (post.body ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  return text.length > 220 ? `${text.slice(0, 217).trimEnd()}…` : text;
+}
+
+/** One-line teaser for a feed row, so a long announcement cannot wrap the bell. */
+function summarize(text: string | null | undefined, max = 160): string | null {
+  const clean = (text ?? '').replace(/\s+/g, ' ').trim();
+  if (!clean) return null;
+  return clean.length > max ? `${clean.slice(0, max - 1).trimEnd()}…` : clean;
+}
+
 async function withPhotos(albums: AlbumRow[]): Promise<Array<AlbumRow & { photos: AlbumPhotoRow[] }>> {
   return Promise.all(
     albums.map(async (album) => ({
@@ -182,6 +284,75 @@ async function withPhotos(albums: AlbumRow[]): Promise<Array<AlbumRow & { photos
       ),
     }))
   );
+}
+
+/** Attaches each post's extra photos, in the order the article shows them. */
+async function withBlogImages(posts: BlogRow[]): Promise<Array<BlogRow & { images: string[] }>> {
+  return Promise.all(
+    posts.map(async (post) => {
+      const rows = await queryAll<BlogImageRow>(
+        'SELECT image FROM blog_images WHERE blog_post_id = ? ORDER BY sort_order ASC, created_at ASC LIMIT ?',
+        [post.id, MAX_BLOG_IMAGES]
+      );
+      return { ...post, images: rows.map((row) => row.image) };
+    })
+  );
+}
+
+/**
+ * Normalises the `keepImages` body field of an edit: a JSON array of the
+ * gallery filenames the admin did not remove. Basenames only, so a crafted
+ * value can never match a row by path trickery.
+ */
+function parseKeepImages(raw: unknown): string[] {
+  const parsed: unknown = typeof raw === 'string' && raw.trim().startsWith('[')
+    ? (() => { try { return JSON.parse(raw); } catch { return null; } })()
+    : raw;
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .filter((value): value is string => typeof value === 'string' && value.length > 0)
+    .map((value) => path.basename(value));
+}
+
+/**
+ * Replaces a post's gallery in one transaction: rows the admin dropped are
+ * deleted (and their files unlinked), new uploads are appended after the
+ * survivors. The caller checks the combined count first, so this helper can
+ * assume it stays inside MAX_BLOG_IMAGES.
+ */
+async function syncBlogImages(
+  postId: string,
+  existing: BlogImageRow[],
+  keepNames: string[],
+  newFiles: Express.Multer.File[]
+): Promise<void> {
+  const kept = existing.filter((row) => keepNames.includes(row.image));
+  const dropped = existing.filter((row) => !keepNames.includes(row.image));
+  let sortOrder = kept.reduce((max, row) => Math.max(max, row.sort_order), -1) + 1;
+
+  // One transaction for the whole batch: without it, a failure on photo 3 of
+  // 5 would leave earlier rows committed while their files are about to be
+  // deleted, producing rows nothing on disk can satisfy.
+  try {
+    await withTransaction(async (conn) => {
+      for (const row of dropped) {
+        await conn.execute('DELETE FROM blog_images WHERE id = ?', [row.id]);
+      }
+      for (const file of newFiles) {
+        await conn.execute(
+          'INSERT INTO blog_images (id, blog_post_id, image, sort_order) VALUES (?, ?, ?, ?)',
+          [uuidv4(), postId, file.filename, sortOrder++]
+        );
+      }
+    });
+  } catch (err) {
+    // The transaction rolled back every row, so the new files on disk are
+    // unreachable — remove them before surfacing the error.
+    for (const file of newFiles) removeUpload('blogs', file.filename);
+    throw err;
+  }
+
+  for (const row of dropped) removeUpload('blogs', row.image);
 }
 
 /** Next append position for a leader's display order. */
@@ -229,6 +400,101 @@ router.get('/events', browseLimiter, asyncHandler(async (_req, res: Response) =>
     queryAll<EventRow>('SELECT * FROM events ORDER BY starts_at DESC LIMIT ?', [MAX_ROWS])
   );
   res.json(events);
+}));
+
+/* ------------------------------------------------------------------ *
+ * Blog
+ * ------------------------------------------------------------------ */
+
+// Published posts only: the list is the public feed, and a draft must not
+// leak through a cached response just because an admin previewed it once.
+router.get('/blog', browseLimiter, asyncHandler(async (_req, res: Response) => {
+  const posts = await cachedList(BLOG_KEY, async () =>
+    withBlogImages(
+      await queryAll<BlogRow>(
+        'SELECT id, slug, title, excerpt, category, cover_image, published, created_at, updated_at ' +
+          'FROM blog_posts WHERE published = 1 ORDER BY created_at DESC LIMIT ?',
+        [MAX_ROWS]
+      )
+    )
+  );
+  res.json(posts);
+}));
+
+// Registered before /blog/:slug so "admin" is never parsed as a slug.
+router.get('/blog/admin', authenticate, requireAdmin, asyncHandler(async (_req, res: Response) => {
+  const posts = await withBlogImages(
+    await queryAll<BlogRow>('SELECT * FROM blog_posts ORDER BY created_at DESC LIMIT ?', [MAX_ROWS])
+  );
+  res.json(posts);
+}));
+
+router.get('/blog/:slug', browseLimiter, asyncHandler(async (req, res: Response) => {
+  const post = await queryOne<BlogRow>('SELECT * FROM blog_posts WHERE slug = ? AND published = 1', [
+    String(req.params.slug),
+  ]);
+  if (!post) return res.status(404).json({ error: 'Post not found' });
+  res.json((await withBlogImages([post]))[0]);
+}));
+
+/**
+ * Merged recency feed behind the notification bell: the newest blog posts,
+ * announcements and events in one list, so the client polls one endpoint
+ * instead of three and the blink logic compares a single timestamp.
+ */
+router.get('/whats-new', browseLimiter, asyncHandler(async (_req, res: Response) => {
+  const cached = await cacheGet<WhatsNewItem[]>(WHATS_NEW_KEY);
+  if (cached) return res.json(cached);
+
+  const [posts, announcements, events] = await Promise.all([
+    queryAll<{ id: string; slug: string; title: string; excerpt: string | null; body: string | null; cover_image: string | null; created_at: string }>(
+      'SELECT id, slug, title, excerpt, body, cover_image, created_at FROM blog_posts WHERE published = 1 ORDER BY created_at DESC LIMIT ?',
+      [FEED_ROWS]
+    ),
+    queryAll<{ id: string; title: string; body: string | null; created_at: string }>(
+      'SELECT id, title, body, created_at FROM announcements ORDER BY created_at DESC LIMIT ?',
+      [FEED_ROWS]
+    ),
+    queryAll<{ id: string; title: string; description: string | null; location: string | null; created_at: string }>(
+      'SELECT id, title, description, location, created_at FROM events ORDER BY created_at DESC LIMIT ?',
+      [FEED_ROWS]
+    ),
+  ]);
+
+  const items: WhatsNewItem[] = [
+    ...posts.map((post) => ({
+      id: post.id,
+      type: 'blog' as const,
+      title: post.title,
+      summary: deriveExcerpt({ excerpt: post.excerpt, body: post.body }),
+      image: post.cover_image,
+      url: `/blog/${post.slug}`,
+      published_at: post.created_at,
+    })),
+    ...announcements.map((row) => ({
+      id: row.id,
+      type: 'announcement' as const,
+      title: row.title,
+      summary: summarize(row.body),
+      image: null,
+      url: '/',
+      published_at: row.created_at,
+    })),
+    ...events.map((row) => ({
+      id: row.id,
+      type: 'event' as const,
+      title: row.title,
+      summary: summarize(row.location ? `${row.location} — ${row.description ?? ''}` : row.description),
+      image: null,
+      url: '/',
+      published_at: row.created_at,
+    })),
+  ];
+
+  items.sort((a, b) => (a.published_at < b.published_at ? 1 : a.published_at > b.published_at ? -1 : 0));
+  const feed = items.slice(0, FEED_LIMIT);
+  await cacheSet(WHATS_NEW_KEY, feed, WHATS_NEW_TTL);
+  res.json(feed);
 }));
 
 /* ------------------------------------------------------------------ *
@@ -538,7 +804,7 @@ router.post('/announcements', writeLimiter, authenticate, requireAdmin, asyncHan
   await runSQL('INSERT INTO announcements (id, title, body, pinned, created_by) VALUES (?, ?, ?, ?, ?)',
     [id, cleanTitle, cleanBody || null, isPinned, req.user!.id]);
 
-  await cacheDelete(...siteReadCacheKeys('announcements'));
+  await cacheDelete(...feedReadCacheKeys('announcements'));
   res.status(201).json({ id, title: cleanTitle, body: cleanBody || null, pinned: isPinned });
 }));
 
@@ -567,7 +833,7 @@ router.put('/announcements/:id', writeLimiter, authenticate, requireAdmin, async
     req.params.id,
   ]);
 
-  await cacheDelete(...siteReadCacheKeys('announcements'));
+  await cacheDelete(...feedReadCacheKeys('announcements'));
   res.json({ message: 'Announcement updated' });
 }));
 
@@ -576,7 +842,7 @@ router.delete('/announcements/:id', writeLimiter, authenticate, requireSuperAdmi
   if (!announcement) return res.status(404).json({ error: 'Announcement not found' });
 
   await runSQL('DELETE FROM announcements WHERE id = ?', [req.params.id]);
-  await cacheDelete(...siteReadCacheKeys('announcements'));
+  await cacheDelete(...feedReadCacheKeys('announcements'));
   res.json({ message: 'Announcement deleted' });
 }));
 
@@ -617,7 +883,7 @@ router.post('/events', writeLimiter, authenticate, requireAdmin, asyncHandler(as
     [id, cleanTitle, cleanDescription || null, cleanLocation || null, start, end, req.user!.id]
   );
 
-  await cacheDelete(...siteReadCacheKeys('events'));
+  await cacheDelete(...feedReadCacheKeys('events'));
   res.status(201).json({
     id, title: cleanTitle, description: cleanDescription || null,
     location: cleanLocation || null, starts_at: start, ends_at: end,
@@ -671,7 +937,7 @@ router.put('/events/:id', writeLimiter, authenticate, requireAdmin, asyncHandler
     req.params.id,
   ]);
 
-  await cacheDelete(...siteReadCacheKeys('events'));
+  await cacheDelete(...feedReadCacheKeys('events'));
   res.json({ message: 'Event updated' });
 }));
 
@@ -680,8 +946,186 @@ router.delete('/events/:id', writeLimiter, authenticate, requireSuperAdmin, asyn
   if (!event) return res.status(404).json({ error: 'Event not found' });
 
   await runSQL('DELETE FROM events WHERE id = ?', [req.params.id]);
-  await cacheDelete(...siteReadCacheKeys('events'));
+  await cacheDelete(...feedReadCacheKeys('events'));
   res.json({ message: 'Event deleted' });
+}));
+
+/* ------------------------------------------------------------------ *
+ * Blog posts
+ * ------------------------------------------------------------------ */
+
+/** Reads the two upload fields multer's `fields()` middleware populated. */
+function blogUploadFields(req: AuthRequest): { cover?: Express.Multer.File; gallery: Express.Multer.File[] } {
+  const files = (req.files as Record<string, Express.Multer.File[] | undefined> | undefined) ?? {};
+  return { cover: files.cover?.[0], gallery: files.images ?? [] };
+}
+
+router.post('/blog', writeLimiter, authenticate, requireAdmin, uploadLimiter, blogUpload.fields([
+  { name: 'cover', maxCount: 1 },
+  { name: 'images', maxCount: MAX_BLOG_IMAGES },
+]), asyncHandler(async (req: AuthRequest, res: Response) => {
+  // Multer has already written every file by the time the handler runs, so
+  // every rejection below has to delete all of them or the failed request
+  // leaks the cover and up to six gallery photos.
+  const { cover, gallery } = blogUploadFields(req);
+  const invalid = (error: string) => {
+    removeUpload('blogs', cover?.filename);
+    for (const file of gallery) removeUpload('blogs', file.filename);
+    return res.status(400).json({ error });
+  };
+
+  const { title, excerpt, body, category, published } = req.body ?? {};
+
+  const cleanTitle = singleString(title);
+  if (!cleanTitle) return invalid('Title is required');
+  const cleanExcerpt = singleString(excerpt);
+  const cleanBody = singleString(body);
+  const cleanCategory = singleString(category);
+  for (const [label, value, max] of [
+    ['Title', cleanTitle, MAX_TITLE],
+    ['Excerpt', cleanExcerpt, MAX_EXCERPT],
+    ['Body', cleanBody, MAX_BLOG_BODY],
+    ['Category', cleanCategory, MAX_CATEGORY],
+  ] as const) {
+    if (value && value.length > max) return invalid(`${label} must be ${max} characters or fewer`);
+  }
+  if (gallery.length > MAX_BLOG_IMAGES) {
+    return invalid(`A post can hold at most ${MAX_BLOG_IMAGES} photos`);
+  }
+  // The excerpt is what every card and feed row shows; deriving it from the
+  // body keeps the public list complete even when the field was skipped.
+  const storedExcerpt = cleanExcerpt || deriveExcerpt({ body: cleanBody });
+  // An absent flag means publish: the admin form always sends one, so only an
+  // explicit false/0 keeps a post off the public site.
+  const isPublished = published === undefined ? 1 : coerceBool(published) ? 1 : 0;
+
+  const id = uuidv4();
+  let slug: string;
+  try {
+    slug = await uniqueSlug(cleanTitle);
+    await runSQL(
+      'INSERT INTO blog_posts (id, slug, title, excerpt, body, category, cover_image, published, created_by) ' +
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, slug, cleanTitle, storedExcerpt, cleanBody || null, cleanCategory || null,
+       cover?.filename ?? null, isPublished, req.user!.id]
+    );
+    await syncBlogImages(id, [], [], gallery);
+  } catch (err) {
+    // Multer has already written the cover; without this a failed INSERT
+    // orphans it on disk with no row to ever find it by.
+    removeUpload('blogs', cover?.filename);
+    throw err;
+  }
+
+  await cacheDelete(...feedReadCacheKeys('blog'));
+  res.status(201).json({
+    id, slug, title: cleanTitle, excerpt: storedExcerpt, body: cleanBody || null,
+    category: cleanCategory || null, cover_image: cover?.filename ?? null,
+    images: gallery.map((file) => file.filename), published: isPublished,
+  });
+}));
+
+router.put('/blog/:id', writeLimiter, authenticate, requireAdmin, uploadLimiter, blogUpload.fields([
+  { name: 'cover', maxCount: 1 },
+  { name: 'images', maxCount: MAX_BLOG_IMAGES },
+]), asyncHandler(async (req: AuthRequest, res: Response) => {
+  const { cover, gallery } = blogUploadFields(req);
+  const reject = (status: number, error: string) => {
+    removeUpload('blogs', cover?.filename);
+    for (const file of gallery) removeUpload('blogs', file.filename);
+    return res.status(status).json({ error });
+  };
+
+  const post = await queryOne<BlogRow>('SELECT * FROM blog_posts WHERE id = ?', [req.params.id]);
+  if (!post) return reject(404, 'Post not found');
+
+  const { title, excerpt, body, category, published } = req.body ?? {};
+
+  const cleanTitle = singleString(title);
+  if (title !== undefined && !cleanTitle) return reject(400, 'Title cannot be empty');
+  const cleanExcerpt = singleString(excerpt);
+  const cleanBody = singleString(body);
+  const cleanCategory = singleString(category);
+  for (const [label, value, max] of [
+    ['Title', cleanTitle, MAX_TITLE],
+    ['Excerpt', cleanExcerpt, MAX_EXCERPT],
+    ['Body', cleanBody, MAX_BLOG_BODY],
+    ['Category', cleanCategory, MAX_CATEGORY],
+  ] as const) {
+    if (value && value.length > max) return reject(400, `${label} must be ${max} characters or fewer`);
+  }
+
+  const existing = await queryAll<BlogImageRow>(
+    'SELECT * FROM blog_images WHERE blog_post_id = ? ORDER BY sort_order ASC',
+    [req.params.id]
+  );
+  // A request without `keepImages` (an API client rather than the admin form)
+  // leaves the gallery untouched; the form always lists what survives.
+  const keepNames = req.body?.keepImages === undefined
+    ? existing.map((row) => row.image)
+    : parseKeepImages(req.body.keepImages);
+  const keptCount = existing.filter((row) => keepNames.includes(row.image)).length;
+  if (keptCount + gallery.length > MAX_BLOG_IMAGES) {
+    return reject(400, `A post can hold at most ${MAX_BLOG_IMAGES} photos`);
+  }
+
+  // The slug is deliberately never rewritten: it is the post's permanent
+  // link, and an edit to the title must not break every URL already shared.
+  const updatedTitle = cleanTitle || post.title;
+  const nextBody = body !== undefined ? (cleanBody || null) : post.body;
+  const nextExcerpt = excerpt !== undefined
+    ? (cleanExcerpt || deriveExcerpt({ body: nextBody }))
+    : (cleanExcerpt ? cleanExcerpt : post.excerpt);
+  const nextCover = cover ? cover.filename : post.cover_image;
+
+  await runSQL(
+    'UPDATE blog_posts SET title = ?, excerpt = ?, body = ?, category = ?, cover_image = ?, published = ? WHERE id = ?',
+    [
+      updatedTitle,
+      nextExcerpt,
+      nextBody,
+      category !== undefined ? (cleanCategory || null) : post.category,
+      nextCover,
+      published !== undefined ? (coerceBool(published) ? 1 : 0) : post.published,
+      req.params.id,
+    ]
+  );
+
+  await syncBlogImages(post.id, existing, keepNames, gallery);
+
+  if (cover) removeUpload('blogs', post.cover_image);
+
+  await cacheDelete(...feedReadCacheKeys('blog'));
+  res.json({ message: 'Post updated' });
+}));
+
+router.delete('/blog/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res) => {
+  const post = await queryOne<BlogRow>('SELECT * FROM blog_posts WHERE id = ?', [req.params.id]);
+  if (!post) return res.status(404).json({ error: 'Post not found' });
+
+  const images = await queryAll<BlogImageRow>('SELECT image FROM blog_images WHERE blog_post_id = ?', [
+    post.id,
+  ]);
+
+  // The rows go with the post (ON DELETE CASCADE); the files have no such
+  // luck and have to be unlinked by hand.
+  await runSQL('DELETE FROM blog_posts WHERE id = ?', [req.params.id]);
+  removeUpload('blogs', post.cover_image);
+  for (const row of images) removeUpload('blogs', row.image);
+
+  await cacheDelete(...feedReadCacheKeys('blog'));
+  res.json({ message: 'Post deleted' });
+}));
+
+router.delete('/blog/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
+  const post = await queryOne<BlogRow>('SELECT * FROM blog_posts WHERE id = ?', [req.params.id]);
+  if (!post) return res.status(404).json({ error: 'Post not found' });
+
+  await runSQL('DELETE FROM blog_posts WHERE id = ?', [req.params.id]);
+  removeUpload('blogs', post.cover_image);
+
+  await cacheDelete(...feedReadCacheKeys('blog'));
+  res.json({ message: 'Post deleted' });
 }));
 
 export default router;
