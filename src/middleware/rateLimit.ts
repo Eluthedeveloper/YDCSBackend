@@ -2,11 +2,6 @@ import rateLimit, { type RateLimitRequestHandler } from 'express-rate-limit';
 import { RedisStore, type RedisReply } from 'rate-limit-redis';
 import { rateLimitRedis } from '../cache/redis';
 
-// A shared in-process store silently resets on restart and is per-instance, so
-// scaling out gives every replica its own fresh counter and any deploy hands
-// attackers a fresh budget. Redis keeps the budget consistent across replicas
-// and restarts; without Redis we fall back to memory, which is at least correct
-// for a single instance.
 function store(prefix: string) {
   if (!rateLimitRedis) return undefined;
   return new RedisStore({
@@ -67,9 +62,7 @@ export const uploadLimiter = limiter({
   message: 'Upload limit reached, try again later.',
 });
 
-// One request per 5 MB audio chunk. A 100 MB file is 20 chunks; a 50-file
-// bulk session is ~1000 chunk posts, so this has to stay well above that
-// while still bounding a runaway or abusive client.
+
 export const chunkLimiter = limiter({
   prefix: 'chunk',
   windowMs: 60 * 60 * 1000,
