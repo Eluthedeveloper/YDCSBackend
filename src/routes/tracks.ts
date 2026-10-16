@@ -10,7 +10,9 @@ import { AuthRequest, authenticate, requireSuperAdmin, requireAdmin } from '../m
 import { writeLimiter, uploadLimiter, chunkLimiter } from '../middleware/rateLimit';
 import { cacheDelete } from '../cache/redis';
 import { programReadCacheKeys } from '../lib/cacheKeys';
-import { singleString, coerceDuration } from '../lib/validate';
+import { singleString, coerceDuration, MAX_ALBUM, MAX_ARTIST, MAX_TITLE } from '../lib/validate';
+import { readAudioTags, resolveTrackMeta } from '../lib/audioTags';
+import type { TrackMeta } from '../lib/audioTags';
 import { asyncHandler } from '../lib/asyncHandler';
 
 const router = Router();
@@ -24,12 +26,8 @@ const MAX_BULK_FILES = 50;
 // work done while holding a pool connection. 50 matches the bulk upload cap.
 const MAX_REORDER_IDS = 50;
 
-// Mirrors the VARCHAR(255) column widths. Without this, MySQL in strict mode
-// rejects the statement outright and the request fails as an opaque 500 rather
-// than a message naming the offending field.
-const MAX_TITLE = 255;
-const MAX_ARTIST = 255;
-const MAX_ALBUM = 255;
+const MAX_DELETE_IDS = 50;
+
 
 /**
  * Reserves the next sort_order for a track in `programId`.
@@ -275,6 +273,15 @@ router.post('/', authenticate, requireAdmin, uploadLimiter, uploadTrack.single('
   }
 
   const id = uuidv4();
+  const tags = await readAudioTags(path.join(UPLOADS_ROOT, 'tracks', req.file.filename));
+  const meta = resolveTrackMeta({
+    title: cleanTitle,
+    artist: cleanArtist,
+    album: cleanAlbum,
+    originalName: req.file.originalname,
+    tags,
+  });
+
   let sortOrder: number;
   try {
     // The row lock taken by reserveSortOrder has to be held through the INSERT,
@@ -283,7 +290,7 @@ router.post('/', authenticate, requireAdmin, uploadLimiter, uploadTrack.single('
       const next = await reserveSortOrder(conn, cleanProgramId);
       await conn.execute(
         'INSERT INTO tracks (id, title, artist, album, duration, file_path, program_id, track_type, sort_order, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [id, cleanTitle, cleanArtist || null, cleanAlbum || null, duration, req.file!.filename, cleanProgramId, cleanTrackType, next, req.user!.id]
+        [id, meta.title, meta.artist, meta.album, duration, req.file!.filename, cleanProgramId, cleanTrackType, next, req.user!.id]
       );
       return next;
     });
@@ -295,7 +302,7 @@ router.post('/', authenticate, requireAdmin, uploadLimiter, uploadTrack.single('
   }
 
   await cacheDelete(...programReadCacheKeys(cleanProgramId));
-  res.status(201).json({ id, title: cleanTitle, artist, album, file_path: req.file.filename, program_id: cleanProgramId, track_type: cleanTrackType, sort_order: sortOrder });
+  res.status(201).json({ id, title: meta.title, artist: meta.artist, album: meta.album, file_path: req.file.filename, program_id: cleanProgramId, track_type: cleanTrackType, sort_order: sortOrder });
 }));
 
 router.post('/bulk', authenticate, requireAdmin, uploadLimiter, uploadTrack.array('audio_files', MAX_BULK_FILES), asyncHandler(async (req: AuthRequest, res: Response) => {
@@ -335,6 +342,21 @@ router.post('/bulk', authenticate, requireAdmin, uploadLimiter, uploadTrack.arra
     const program = await queryOne('SELECT id FROM programs WHERE id = ?', [program_id]);
     if (!program) return reject(404, 'Program not found');
 
+    // Tags are read before the transaction opens: parsing files while holding a
+    // pooled connection would stall every other request for the whole batch.
+    const resolved: TrackMeta[] = [];
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]!;
+      const tags = await readAudioTags(path.join(UPLOADS_ROOT, 'tracks', file.filename));
+      resolved.push(resolveTrackMeta({
+        title: titles[i] ? String(titles[i]) : null,
+        artist: artists[i] ? String(artists[i]) : null,
+        album: albums[i] ? String(albums[i]) : null,
+        originalName: file.originalname,
+        tags,
+      }));
+    }
+
     const pool = getPool();
     const conn = await pool.getConnection();
     const uploaded: Array<{ id: string; title: string; file_path: string; sort_order: number }> = [];
@@ -344,18 +366,12 @@ router.post('/bulk', authenticate, requireAdmin, uploadLimiter, uploadTrack.arra
       for (let i = 0; i < files.length; i++) {
         const file = files[i]!;
         const id = uuidv4();
-        // The fallback is derived from a client-supplied filename, so it is
-        // unbounded too: without the clamp a long filename overflows VARCHAR(255),
-        // the INSERT throws, the transaction rolls back and a legitimate upload
-        // fails with a 500.
-        const trackTitle = ((titles[i] ? String(titles[i]).trim() : '') || file.originalname.replace(/\.[^.]+$/, '')).slice(0, MAX_TITLE);
-        const artist = artists[i] ? String(artists[i]).trim() || null : null;
-        const album = albums[i] ? String(albums[i]).trim() || null : null;
+        const meta = resolved[i]!;
         await conn.execute(
           'INSERT INTO tracks (id, title, artist, album, duration, file_path, program_id, track_type, sort_order, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [id, trackTitle, artist, album, 0, file.filename, program_id, track_type || 'episode', sortOrder, req.user!.id]
+          [id, meta.title, meta.artist, meta.album, 0, file.filename, program_id, track_type || 'episode', sortOrder, req.user!.id]
         );
-        uploaded.push({ id, title: trackTitle, file_path: file.filename, sort_order: sortOrder });
+        uploaded.push({ id, title: meta.title, file_path: file.filename, sort_order: sortOrder });
         sortOrder++;
       }
       await conn.commit();
@@ -552,6 +568,15 @@ router.post('/upload/finalize', authenticate, requireAdmin, uploadLimiter, async
     return res.status(500).json({ error: 'Failed to assemble uploaded file' });
   }
 
+  const tags = await readAudioTags(destPath);
+  const resolved = resolveTrackMeta({
+    title: cleanTitle,
+    artist: cleanArtist,
+    album: cleanAlbum,
+    originalName: meta.original_name,
+    tags,
+  });
+
   const id = uuidv4();
   let sortOrder: number;
   try {
@@ -559,7 +584,7 @@ router.post('/upload/finalize', authenticate, requireAdmin, uploadLimiter, async
       const next = await reserveSortOrder(conn, cleanProgramId);
       await conn.execute(
         'INSERT INTO tracks (id, title, artist, album, duration, file_path, program_id, track_type, sort_order, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [id, cleanTitle, cleanArtist || null, cleanAlbum || null, duration, filename, cleanProgramId, cleanTrackType, next, req.user!.id]
+        [id, resolved.title, resolved.artist, resolved.album, duration, filename, cleanProgramId, cleanTrackType, next, req.user!.id]
       );
       return next;
     });
@@ -573,9 +598,9 @@ router.post('/upload/finalize', authenticate, requireAdmin, uploadLimiter, async
   await cacheDelete(...programReadCacheKeys(cleanProgramId));
   res.status(201).json({
     id,
-    title: cleanTitle,
-    artist: cleanArtist || null,
-    album: cleanAlbum || null,
+    title: resolved.title,
+    artist: resolved.artist,
+    album: resolved.album,
     file_path: filename,
     program_id: cleanProgramId,
     track_type: cleanTrackType,
@@ -652,6 +677,44 @@ router.put('/reorder/:programId', writeLimiter, authenticate, requireAdmin, asyn
 
   await cacheDelete(...programReadCacheKeys(programId));
   res.json({ message: 'Order updated' });
+}));
+
+router.delete('/', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
+  const { trackIds } = req.body ?? {};
+  if (!Array.isArray(trackIds) || trackIds.length === 0) {
+    return res.status(400).json({ error: 'trackIds array required' });
+  }
+  if (trackIds.length > MAX_DELETE_IDS) {
+    return res.status(400).json({ error: `At most ${MAX_DELETE_IDS} tracks can be deleted at once` });
+  }
+  if (!trackIds.every((id: unknown) => typeof id === 'string' && id.length > 0)) {
+    return res.status(400).json({ error: 'trackIds must be non-empty strings' });
+  }
+
+  const placeholders = trackIds.map(() => '?').join(',');
+  const rows = await queryAll<{ id: string; file_path: string | null; program_id: string }>(
+    `SELECT id, file_path, program_id FROM tracks WHERE id IN (${placeholders})`,
+    trackIds
+  );
+
+  if (rows.length > 0) {
+    await runSQL(`DELETE FROM tracks WHERE id IN (${placeholders})`, trackIds);
+    const programIds = [...new Set(rows.map((row) => row.program_id))];
+    await cacheDelete(...programIds.flatMap((programId) => programReadCacheKeys(programId)));
+  }
+
+  for (const row of rows) {
+    if (row.file_path) {
+      fs.unlink(path.join(UPLOADS_ROOT, 'tracks', path.basename(row.file_path))).catch(() => {});
+    }
+  }
+
+  const deleted = new Set(rows.map((row) => row.id));
+  res.json({
+    message: 'Tracks deleted',
+    deleted: rows.length,
+    notFound: trackIds.filter((id: string) => !deleted.has(id)),
+  });
 }));
 
 router.delete('/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {

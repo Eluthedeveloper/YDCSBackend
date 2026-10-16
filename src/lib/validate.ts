@@ -31,3 +31,10 @@ export function coerceDuration(value: unknown, fallback: number): number | null 
   const parsed = typeof value === 'number' ? value : Number(String(value).trim());
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
+
+// Mirrors the VARCHAR(255) column widths on tracks. MySQL in strict mode
+// rejects the statement outright, so anything bound into those columns has to
+// be clamped here rather than discovered as an opaque 500 at insert time.
+export const MAX_TITLE = 255;
+export const MAX_ARTIST = 255;
+export const MAX_ALBUM = 255;
