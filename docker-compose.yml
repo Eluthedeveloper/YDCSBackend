@@ -62,6 +62,10 @@ services:
       SMTP_FROM_NAME: ${SMTP_FROM_NAME:-YDCS Radio}
       CONTACT_RECEIVER: ${CONTACT_RECEIVER:-}
       CONTACT_PHONE: ${CONTACT_PHONE:-}
+      # Visitor chat. The key is only ever read here, never by the frontend.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
+      GEMINI_FALLBACK_MODELS: ${GEMINI_FALLBACK_MODELS:-gemini-3.5-flash,gemini-3.8-flash}
     volumes:
       # Bind mount, not a named volume. The backend also runs outside Docker on
       # the host against this same database, so a named volume would give the

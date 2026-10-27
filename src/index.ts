@@ -17,6 +17,7 @@ import publicRoutes from './routes/public';
 import analyticsRoutes from './routes/analytics';
 import contactRoutes from './routes/contact';
 import siteRoutes from './routes/site';
+import chatRoutes from './routes/chat';
 
 import { generalLimiter, browseLimiter, authLimiter } from './middleware/rateLimit';
 
@@ -331,6 +332,9 @@ export function createApp() {
   app.use('/api/public', browseLimiter, publicRoutes);
   app.use('/api/analytics', analyticsRoutes);
   app.use('/api/contact', contactRoutes);
+  // The router applies chatLimiter itself; adding it here too would count every
+  // request twice and halve the intended limit.
+  app.use('/api/chat', chatRoutes);
 
   console.log('API routes registered.');
 

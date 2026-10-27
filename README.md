@@ -28,6 +28,8 @@ placeholders. Never commit the filled-in file. One `.env` serves both
 | `JWT_SECRET` | 48 random bytes hex. Rotating it invalidates every session |
 | `REDIS_ENABLED` | `false` runs without Redis; otherwise rate limiting and caching need it |
 | `SMTP_*`, `CONTACT_*` | Contact form delivery; use a Gmail App Password |
+| `GEMINI_API_KEY` | Visitor chatbot. Server-side only; never expose it to the browser |
+| `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS` | Optional model overrides for the chatbot |
 | `NODE_ENV` | `production` marks session cookies `secure` |
 
 The CORS allowlist in `src/index.ts` is an explicit origin list, not an
@@ -37,6 +39,31 @@ preflight rejects the like and listen calls.
 
 `docker compose up -d --build` builds both services and wires nginx to the API
 on the same origin, which keeps the session cookie first-party.
+
+## Visitor chatbot
+
+`POST /api/chat` powers the floating assistant on the public site. The browser
+posts `{ messages: [{ role, text }], lang }` and receives `{ reply }`; the API
+key and the organisation prompt never leave the server.
+
+- The facts the assistant may use are in `src/lib/orgKnowledge.ts`. Update that
+  file when public details (address, staff, services, bookshops) change.
+- The assistant can also read live public content through the read-only tools in
+  `src/lib/chatDatabase.ts`: programmes, tracks, **published** blog articles,
+  announcements, events, leaders, photo albums and public counts. Each query is
+  written out in full, uses bound `?` parameters, is limited to a handful of
+  rows, and maps only public columns. The tools deliberately cannot reach
+  `users`, passwords, emails, comments, likes or listening history.
+- A reply may use up to two tool rounds, with a 45-second deadline for the whole
+  exchange so a slow model does not leave the visitor waiting indefinitely.
+- The route trims history to the last 12 turns, caps messages at 1500
+  characters, and applies `chatLimiter` (40 messages per 15 minutes per IP).
+- `GEMINI_MODEL` is tried first; if it fails for any reason (quota, overload,
+  timeout, empty response or a bad request), `GEMINI_FALLBACK_MODELS` are tried
+  in order. A safety block is answered calmly instead of being retried on
+  another model.
+- Responses are sent with `Cache-Control: no-store` because each conversation
+  is specific to one visitor.
 
 ## Schema
 

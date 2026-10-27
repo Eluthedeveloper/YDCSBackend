@@ -83,3 +83,13 @@ export const contactLimiter = limiter({
   max: 10,
   message: 'Too many messages, please try again later.',
 });
+
+// Each chat message is a paid upstream request, so this is tighter than the
+// browse limit but loose enough for a real conversation (a visitor asking a
+// dozen follow-up questions is still well inside it).
+export const chatLimiter = limiter({
+  prefix: 'chat',
+  windowMs: 15 * 60 * 1000,
+  max: 40,
+  message: 'Too many chat messages, please try again later.',
+});

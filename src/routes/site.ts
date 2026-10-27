@@ -49,7 +49,27 @@ const MAX_BLOG_IMAGES = 6;
 // Bound on rows any list returns: enough for a homepage feed, small enough
 // that one request can never materialise an unbounded table.
 const MAX_ROWS = 100;
-const MAX_PHOTOS_PER_ALBUM = 500;
+const MAX_PHOTOS_PER_ALBUM = 500;// Album department slugs: a NULL department keeps the album on the general
+// Gallery page, one of these mounts it on that department's page too. Frontend
+// department pages query by slug, so changing a value here breaks their feed —
+// they must be changed together.
+const ALLOWED_ALBUM_DEPARTMENTS = ['electronic', 'print', 'finance', 'resource'] as const;
+
+/**
+ * A submitted department as a stored slug.
+ *
+ * `slug === undefined` means "not submitted" (a PUT leaves the stored value
+ * alone), `slug === null` means "clear it", a string is one of the allowed
+ * slugs, and `{ ok: false }` is a value that is neither blank nor allowed.
+ */
+function parseAlbumDepartment(value: unknown): { ok: true; slug: string | null | undefined } | { ok: false } {
+  if (value === undefined) return { ok: true, slug: undefined };
+  const clean = singleString(value);
+  if (!clean) return { ok: true, slug: null };
+  if (!(ALLOWED_ALBUM_DEPARTMENTS as readonly string[]).includes(clean)) return { ok: false };
+  return { ok: true, slug: clean };
+}
+
 // 15 MB — the same cap programs.ts uses for covers, so ordinary phone photos
 // pass and the frontend's client-side check stays one shared constant.
 const MAX_PHOTO_BYTES = 15 * 1024 * 1024;
@@ -89,6 +109,7 @@ interface AlbumRow {
   id: string;
   title: string;
   description: string | null;
+  department: string | null;
   created_by: string;
 }
 
@@ -374,13 +395,18 @@ router.get('/leaders', browseLimiter, asyncHandler(async (_req, res: Response) =
   res.json(leaders);
 }));
 
-router.get('/albums', browseLimiter, asyncHandler(async (_req, res: Response) => {
+router.get('/albums', browseLimiter, asyncHandler(async (req, res: Response) => {
+  // One cached list serves every caller: a `?department=` query filters that
+  // list in memory instead of keying the cache per page, so one admin edit
+  // still invalidates every department's view in a single cacheDelete.
   const albums = await cachedList<AlbumRow & { photos: AlbumPhotoRow[] }>(ALBUMS_KEY, async () =>
     withPhotos(
       await queryAll<AlbumRow>('SELECT * FROM albums ORDER BY created_at DESC LIMIT ?', [MAX_ROWS])
     )
   );
-  res.json(albums);
+  const parsed = parseAlbumDepartment(req.query.department);
+  if (!parsed.ok || parsed.slug === undefined) return res.json(albums);
+  return res.json(albums.filter((album) => album.department === parsed.slug));
 }));
 
 router.get('/announcements', browseLimiter, asyncHandler(async (_req, res: Response) => {
@@ -649,7 +675,7 @@ router.delete('/leaders/:id', writeLimiter, authenticate, requireSuperAdmin, asy
  * ------------------------------------------------------------------ */
 
 router.post('/albums', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
-  const { title, description } = req.body ?? {};
+  const { title, description, department } = req.body ?? {};
 
   const cleanTitle = singleString(title);
   if (!cleanTitle) return res.status(400).json({ error: 'Title is required' });
@@ -660,20 +686,27 @@ router.post('/albums', writeLimiter, authenticate, requireAdmin, asyncHandler(as
   if (cleanDescription && cleanDescription.length > MAX_DESCRIPTION_SHORT) {
     return res.status(400).json({ error: `Description must be ${MAX_DESCRIPTION_SHORT} characters or fewer` });
   }
+  const parsedDepartment = parseAlbumDepartment(department);
+  if (!parsedDepartment.ok) {
+    return res.status(400).json({ error: `Department must be one of: ${ALLOWED_ALBUM_DEPARTMENTS.join(', ')}` });
+  }
 
   const id = uuidv4();
-  await runSQL('INSERT INTO albums (id, title, description, created_by) VALUES (?, ?, ?, ?)',
-    [id, cleanTitle, cleanDescription || null, req.user!.id]);
+  // An empty department query means "gallery only" on both the public filter
+  // and the stored row, so the query parameter and this column stay consistent.
+  const storedDepartment = parsedDepartment.slug ?? null;
+  await runSQL('INSERT INTO albums (id, title, description, department, created_by) VALUES (?, ?, ?, ?, ?)',
+    [id, cleanTitle, cleanDescription || null, storedDepartment, req.user!.id]);
 
   await cacheDelete(...siteReadCacheKeys('albums'));
-  res.status(201).json({ id, title: cleanTitle, description: cleanDescription || null, photos: [] });
+  res.status(201).json({ id, title: cleanTitle, description: cleanDescription || null, department: storedDepartment, photos: [] });
 }));
 
 router.put('/albums/:id', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
   const album = await queryOne<AlbumRow>('SELECT * FROM albums WHERE id = ?', [req.params.id]);
   if (!album) return res.status(404).json({ error: 'Album not found' });
 
-  const { title, description } = req.body ?? {};
+  const { title, description, department } = req.body ?? {};
 
   const cleanTitle = singleString(title);
   if (title !== undefined && !cleanTitle) {
@@ -686,10 +719,16 @@ router.put('/albums/:id', writeLimiter, authenticate, requireAdmin, asyncHandler
   if (cleanDescription && cleanDescription.length > MAX_DESCRIPTION_SHORT) {
     return res.status(400).json({ error: `Description must be ${MAX_DESCRIPTION_SHORT} characters or fewer` });
   }
+  const parsedDepartment = parseAlbumDepartment(department);
+  if (!parsedDepartment.ok) {
+    return res.status(400).json({ error: `Department must be one of: ${ALLOWED_ALBUM_DEPARTMENTS.join(', ')}` });
+  }
 
-  await runSQL('UPDATE albums SET title = ?, description = ? WHERE id = ?', [
+  await runSQL('UPDATE albums SET title = ?, description = ?, department = ? WHERE id = ?', [
     cleanTitle || album.title,
     description !== undefined ? (cleanDescription || null) : album.description,
+    // Absent on the request body means "leave it", not "clear it".
+    parsedDepartment.slug !== undefined ? parsedDepartment.slug : album.department,
     req.params.id,
   ]);
 

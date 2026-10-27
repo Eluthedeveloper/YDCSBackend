@@ -246,6 +246,26 @@ const CREATE_TABLES: Migration[] = [
       `);
     },
   },
+  {
+    // Department tag on albums: NULL means "gallery only", one of the allowed
+    // slugs mounts the album on that department's page. ALTER (not a 009 edit)
+    // so databases that already applied 009 get the same schema.
+    name: '015_create_album_department',
+    up: async (conn) => {
+      try {
+        await conn.execute('ALTER TABLE albums ADD COLUMN department VARCHAR(64) NULL');
+      } catch (e: any) {
+        // 1060 = duplicate column: a fresh database that has since been given
+        // the wider 009 definition already carries the column.
+        if (e.errno !== 1060) throw e;
+      }
+      try {
+        await conn.execute('CREATE INDEX idx_albums_department ON albums(department)');
+      } catch (e: any) {
+        if (e.errno !== 1061) throw e;
+      }
+    },
+  },
 ];
 
 const CREATE_INDEXES: Migration[] = [
