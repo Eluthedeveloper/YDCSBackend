@@ -266,7 +266,83 @@ const CREATE_TABLES: Migration[] = [
       }
     },
   },
+  {
+    // Hourly radio grid: one row per (day, hour), unique on the pair. Seeded
+    // idempotently from the lineup that used to be hardcoded in the frontend
+    // RadioSchedule component, so existing installs keep showing today's
+    // programming until an admin edits it — fresh installs start from the
+    // same baseline.
+    name: '016_create_radio_schedule',
+    up: async (conn) => {
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS radio_schedule (
+          id VARCHAR(36) PRIMARY KEY,
+          day ENUM('Mon','Tue','Wed','Thu','Fri','Sat','Sun') NOT NULL,
+          hour TINYINT UNSIGNED NOT NULL,
+          title VARCHAR(255) NOT NULL,
+          host VARCHAR(255) NULL,
+          category ENUM('worship','teaching','talk','music','live') NOT NULL DEFAULT 'talk',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY uq_radio_day_hour (day, hour)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      `);
+      for (const [day, hour, title, host, category] of SEED_RADIO_SCHEDULE) {
+        await conn.execute(
+          'INSERT IGNORE INTO radio_schedule (id, day, hour, title, host, category) VALUES (UUID(), ?, ?, ?, ?, ?)',
+          [day, hour, title, host, category]
+        );
+      }
+    },
+  },
 ];
+
+/**
+ * The lineup previously hardcoded as `SCHEDULE` in the frontend
+ * `RadioSchedule`. Kept here so the first DB-backed render shows exactly what
+ * visitors were used to; admins then edit the real rows.
+ */
+const SEED_RADIO_SCHEDULE: Array<[string, number, string, string | null, string]> = [];
+
+// Nightly recurring block, every day, hours 0-4
+for (const day of ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const) {
+  for (const [hour, title, host, category] of [
+    [0, 'Midnight Prayer & Worship', 'Prayer Team', 'worship'],
+    [1, 'GAZ_TTB – Oromo Bible Study', 'Oromo Team', 'teaching'],
+    [2, 'Morning Devotion (AMH_TTB)', 'Amharic Team', 'teaching'],
+    [3, 'SOM_TTB – Somali Bible Study', 'Somali Team', 'teaching'],
+    [4, 'TIR_TW – Tigrinya Worship', 'Tigrinya Team', 'worship'],
+  ] as Array<[number, string, string, string]>) {
+    SEED_RADIO_SCHEDULE.push([day, hour, title, host, category]);
+  }
+}
+// Day-specific evening programs, verbatim from the old static grid.
+SEED_RADIO_SCHEDULE.push(
+  ['Mon', 5, "Children's Bible Hour", 'Sis. Helen', 'talk'],
+  ['Mon', 6, 'Evening Gospel Music', 'DJ Mark', 'music'],
+  ['Mon', 7, 'Night Intercession', 'Prayer Team', 'live'],
+  ['Tue', 5, 'Youth Talk', 'Bro. Yonas', 'talk'],
+  ['Tue', 6, 'Live Worship Hour', 'Worship Team', 'live'],
+  ['Tue', 7, 'Scripture Reflections', 'Pastor Daniel', 'teaching'],
+  ['Wed', 5, 'Women of Faith', 'Mrs. Esther', 'talk'],
+  ['Wed', 6, 'Testimony Time', 'Mr. Samuel', 'talk'],
+  ['Wed', 7, 'Midweek Revival', 'Pastor Daniel', 'live'],
+  ['Thu', 5, 'Community Matters', 'Mr. Samuel', 'talk'],
+  ['Thu', 6, 'Acoustic Worship', 'Worship Team', 'live'],
+  ['Thu', 7, 'Evening Scriptures', 'Bro. John', 'teaching'],
+  ['Fri', 5, 'Men of Valor', 'Mr. Samuel', 'talk'],
+  ['Fri', 6, 'Live Friday Revival', 'Worship Team', 'live'],
+  ['Fri', 7, 'Night Vigil Broadcast', 'Pastor Daniel', 'worship'],
+  ['Fri', 8, 'Night Vigil Broadcast', 'Pastor Daniel', 'worship'],
+  ['Sat', 5, 'Saturday School', 'Mrs. Esther', 'teaching'],
+  ['Sat', 6, 'Worship Night Preview', 'Worship Team', 'live'],
+  ['Sat', 7, 'Late Night Gospel', 'DJ Mark', 'music'],
+  ['Sun', 2, 'Pre-Service Worship', 'Worship Team', 'worship'],
+  ['Sun', 3, 'Sunday Main Service', 'Pastor Daniel', 'live'],
+  ['Sun', 4, 'Sunday School Replay', 'Mrs. Esther', 'teaching'],
+  ['Sun', 5, 'Afternoon Praise', 'Sis. Grace', 'worship'],
+  ['Sun', 6, 'Evening Thanksgiving', 'Pastor Daniel', 'live'],
+  ['Sun', 7, 'Close of Day Prayers', 'Mr. Samuel', 'worship'],
+);
 
 const CREATE_INDEXES: Migration[] = [
   'CREATE INDEX idx_tracks_program ON tracks(program_id)',

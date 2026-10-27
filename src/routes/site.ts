@@ -429,6 +429,80 @@ router.get('/events', browseLimiter, asyncHandler(async (_req, res: Response) =>
 }));
 
 /* ------------------------------------------------------------------ *
+ * Radio schedule
+ * ------------------------------------------------------------------ */
+
+/** day → list of hour slots, ordered for rendering the weekly grid. */
+const RADIO_DAY_ORDER = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const RADIO_CATEGORIES = ['worship', 'teaching', 'talk', 'music', 'live'] as const;
+
+interface RadioScheduleRow {
+  id: string;
+  day: string;
+  hour: number;
+  title: string;
+  host: string | null;
+  category: string;
+}
+
+router.get('/schedule', browseLimiter, asyncHandler(async (_req, res: Response) => {
+  const rows = await cachedList<RadioScheduleRow>(siteReadCacheKeys('schedule')[0], () =>
+    queryAll<RadioScheduleRow>(
+      `SELECT id, day, hour, title, host, category FROM radio_schedule ` +
+      `ORDER BY FIELD(day, 'Mon','Tue','Wed','Thu','Fri','Sat','Sun'), hour ASC`
+    )
+  );
+  res.json(rows);
+}));
+
+// Upsert-by-slot: the grid is addressed by (day, hour), so an admin editing a
+// slot sends the pair, not an id. One statement covers create and move-in-place.
+router.put('/schedule', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+  const { day, hour, title, host, category } = req.body ?? {};
+
+  if (!RADIO_DAY_ORDER.includes(day)) {
+    return res.status(400).json({ error: `Day must be one of ${RADIO_DAY_ORDER.join(', ')}` });
+  }
+  const hourNum = Number(hour);
+  if (!Number.isInteger(hourNum) || hourNum < 0 || hourNum > 23) {
+    return res.status(400).json({ error: 'Hour must be an integer from 0 to 23' });
+  }
+  const cleanTitle = singleString(title);
+  if (!cleanTitle) return res.status(400).json({ error: 'Title is required' });
+  if (cleanTitle.length > MAX_TITLE) {
+    return res.status(400).json({ error: `Title must be ${MAX_TITLE} characters or fewer` });
+  }
+  const cleanHost = singleString(host);
+  if (cleanHost && cleanHost.length > MAX_LOCATION) {
+    return res.status(400).json({ error: `Host must be ${MAX_LOCATION} characters or fewer` });
+  }
+  const cleanCategory = singleString(category) || 'talk';
+  if (!RADIO_CATEGORIES.includes(cleanCategory as typeof RADIO_CATEGORIES[number])) {
+    return res.status(400).json({ error: `Category must be one of ${RADIO_CATEGORIES.join(', ')}` });
+  }
+
+  const id = uuidv4();
+  await runSQL(
+    `INSERT INTO radio_schedule (id, day, hour, title, host, category) VALUES (?, ?, ?, ?, ?, ?) ` +
+    `ON DUPLICATE KEY UPDATE title = VALUES(title), host = VALUES(host), category = VALUES(category)`,
+    [id, day, hourNum, cleanTitle, cleanHost || null, cleanCategory]
+  );
+
+  await cacheDelete(...siteReadCacheKeys('schedule'));
+  res.json({ message: 'Slot saved' });
+}));
+
+// Clearing a slot takes requireSuperAdmin, matching deletes elsewhere here.
+router.delete('/schedule/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
+  const slot = await queryOne<{ id: string }>('SELECT id FROM radio_schedule WHERE id = ?', [req.params.id]);
+  if (!slot) return res.status(404).json({ error: 'Slot not found' });
+
+  await runSQL('DELETE FROM radio_schedule WHERE id = ?', [req.params.id]);
+  await cacheDelete(...siteReadCacheKeys('schedule'));
+  res.json({ message: 'Slot cleared' });
+}));
+
+/* ------------------------------------------------------------------ *
  * Blog
  * ------------------------------------------------------------------ */
 
