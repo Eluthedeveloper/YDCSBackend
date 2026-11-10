@@ -180,9 +180,15 @@ async function callModel(
         generationConfig: {
           temperature: 0.4,
           topP: 0.9,
-          // Long enough for a helpful answer, short enough that a runaway
-          // generation cannot burn the ministry's quota.
-          maxOutputTokens: 900,
+          // Gemini 3 thinks by default. In testing, internal reasoning used
+          // ~860 of the 900-token budget, so replies arrived truncated to a
+          // sentence or two (and slowly). Visitor Q&A is lookup-and-answer,
+          // not multi-step reasoning, so turn thinking off and give the whole
+          // budget to the visible answer. Function calling still works.
+          thinkingConfig: { thinkingBudget: 0 },
+          // Enough headroom for a few paragraphs plus a short list, but still
+          // bounded so a runaway generation cannot burn the ministry's quota.
+          maxOutputTokens: 1200,
         },
         safetySettings: [
           { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_ONLY_HIGH' },
@@ -362,6 +368,7 @@ router.post(
 
     let lastDetail = '';
     let blocked = false;
+    let quotaExhausted = false;
 
     for (const model of models) {
       const attempt = await runConversation(model, apiKey, turns, lang);
@@ -377,6 +384,14 @@ router.post(
 
       console.warn(`[chat] model ${model} failed: ${attempt.detail}`);
 
+      // Every model uses the same API key, so a quota or rate-limit rejection
+      // is shared: retrying the question on the fallbacks only makes the
+      // visitor wait for another guaranteed failure.
+      if (attempt.status === 429 || /quota|resource_exhausted/i.test(attempt.detail ?? '')) {
+        quotaExhausted = true;
+        break;
+      }
+
       // A safety block is a content decision, not a model outage. Trying the
       // same question on another model would just work around the safety
       // filter, so answer calmly instead of falling back.
@@ -385,13 +400,19 @@ router.post(
         break;
       }
 
-      // Every other failure moves on to the next model: quota, overload,
-      // timeouts, empty responses, tool-loop problems, and even errors that
-      // look permanent for one model. A different model may still work.
+      // Every other failure moves on to the next model: overload, timeouts,
+      // empty responses, tool-loop problems, and even errors that look
+      // permanent for one model. A different model may still work.
     }
 
     if (blocked) {
       return res.json({ reply: BLOCKED_REPLY });
+    }
+
+    if (quotaExhausted) {
+      return res.status(429).json({
+        error: 'The assistant has reached its usage limit. Please try again later or contact us at info@yemisrachdimts.org.',
+      });
     }
 
     console.error(`[chat] all models failed. Last error: ${lastDetail}`);

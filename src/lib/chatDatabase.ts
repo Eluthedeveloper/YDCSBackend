@@ -206,6 +206,69 @@ function likePattern(query: string): string {
   return `%${query.replace(/[!%_]/g, '!$&')}%`;
 }
 
+// Filler the model sometimes passes along with the real topic ("programmes
+// about prayer"). Dropping it keeps a multi-word query from requiring a phrase
+// that no row contains.
+const SEARCH_STOPWORDS = new Set([
+  'a', 'about', 'all', 'also', 'an', 'and', 'any', 'are', 'as', 'at', 'be',
+  'been', 'blog', 'but', 'by', 'can', 'could', 'did', 'do', 'does', 'event',
+  'events', 'for', 'from', 'had', 'has', 'have', 'i', 'if', 'in', 'into', 'is',
+  'it', 'its', 'me', 'my', 'news', 'of', 'on', 'or', 'our', 'please',
+  'program', 'programme', 'programmes', 'programs', 'show', 'some', 'song',
+  'songs', 'tell', 'that', 'the', 'their', 'them', 'this', 'to', 'track',
+  'tracks', 'us', 'want', 'was', 'we', 'were', 'what', 'when', 'where',
+  'which', 'who', 'why', 'will', 'with', 'would', 'you', 'your',
+]);
+
+const MAX_SEARCH_TOKENS = 6;
+
+/** Meaningful keywords from the model's query, deduplicated and bounded. */
+function searchTokens(query: string): string[] {
+  const tokens: string[] = [];
+  for (const word of query.toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+    if (word.length < 2 || SEARCH_STOPWORDS.has(word) || tokens.includes(word)) continue;
+    tokens.push(word);
+    if (tokens.length === MAX_SEARCH_TOKENS) break;
+  }
+  return tokens;
+}
+
+/**
+ * Builds `((col LIKE ?) OR (col LIKE ?)) AND/OR ...` for the given keywords.
+ * Columns are fixed by the caller, so only the pattern values are bound.
+ */
+function tokenWhere(
+  tokens: string[],
+  columns: string[],
+  mode: 'AND' | 'OR'
+): { sql: string; params: string[] } {
+  const clauses = tokens.map(
+    () => `(${columns.map((column) => `${column} LIKE ? ${LIKE_ESCAPE}`).join(' OR ')})`
+  );
+  return {
+    sql: clauses.join(` ${mode} `),
+    params: tokens.flatMap((token) => columns.map(() => likePattern(token))),
+  };
+}
+
+/**
+ * Runs `strict` (all keywords) first, then `loose` (any keyword) so a visitor
+ * who adds one extra word still finds relevant rows.
+ */
+async function keywordRows(
+  tokens: string[],
+  columns: string[],
+  run: (where: { sql: string; params: string[] }) => Promise<Record<string, unknown>[]>
+): Promise<Record<string, unknown>[]> {
+  const attempts = [tokenWhere(tokens, columns, 'AND')];
+  if (tokens.length > 1) attempts.push(tokenWhere(tokens, columns, 'OR'));
+  for (const attempt of attempts) {
+    const rows = await run(attempt);
+    if (rows.length > 0) return rows;
+  }
+  return [];
+}
+
 function mapProgram(row: Record<string, unknown>, query: string) {
   return {
     id: text(row.id),
@@ -283,67 +346,108 @@ function mapAlbum(row: Record<string, unknown>, query: string) {
 }
 
 async function searchPrograms(query: string): Promise<unknown> {
-  const where = query
-    ? `WHERE p.title LIKE ? ${LIKE_ESCAPE} OR p.description LIKE ? ${LIKE_ESCAPE}`
-    : '';
-  const params = query ? [likePattern(query), likePattern(query)] : [];
-
-  const rows = await queryAll(`
+  const tokens = searchTokens(query);
+  const columns = ['p.title', 'p.description'];
+  const select = `
     SELECT p.id, p.title, p.description, p.created_at,
       (SELECT COUNT(*) FROM tracks t WHERE t.program_id = p.id) AS track_count
-    FROM programs p
-    ${where}
-    ORDER BY p.created_at DESC
-    LIMIT ${MAX_PROGRAMS}
-  `, params);
+    FROM programs p`;
+  const newest = () => queryAll<Record<string, unknown>>(
+    `${select} ORDER BY p.created_at DESC LIMIT ${MAX_PROGRAMS}`
+  );
 
-  return { programs: rows.map((row) => mapProgram(row, query)) };
+  let rows: Record<string, unknown>[];
+  if (tokens.length === 0) {
+    rows = await newest();
+  } else {
+    rows = await keywordRows(tokens, columns, (where) =>
+      queryAll<Record<string, unknown>>(
+        `${select} WHERE ${where.sql} ORDER BY p.created_at DESC LIMIT ${MAX_PROGRAMS}`,
+        where.params
+      )
+    );
+  }
+
+  let note: string | undefined;
+  if (tokens.length > 0 && rows.length === 0) {
+    rows = await newest();
+    note = 'No keyword match. Showing the newest programmes instead.';
+  }
+
+  return {
+    programs: rows.map((row) => mapProgram(row, tokens[0] ?? query)),
+    ...(note ? { matched: false, note } : {}),
+  };
 }
 
 async function searchTracks(query: string): Promise<unknown> {
-  const where = query
-    ? `WHERE t.title LIKE ? ${LIKE_ESCAPE}
-        OR t.artist LIKE ? ${LIKE_ESCAPE}
-        OR t.album LIKE ? ${LIKE_ESCAPE}
-        OR p.title LIKE ? ${LIKE_ESCAPE}`
-    : '';
-  const params = query
-    ? [likePattern(query), likePattern(query), likePattern(query), likePattern(query)]
-    : [];
-
-  const rows = await queryAll(`
+  const tokens = searchTokens(query);
+  const columns = ['t.title', 't.artist', 't.album', 'p.title', 'p.description'];
+  const select = `
     SELECT t.id, t.title, t.artist, t.album, t.duration, t.track_type,
       t.program_id, p.title AS program_title, t.created_at
     FROM tracks t
-    JOIN programs p ON p.id = t.program_id
-    ${where}
-    ORDER BY t.created_at DESC
-    LIMIT ${MAX_TRACKS}
-  `, params);
+    JOIN programs p ON p.id = t.program_id`;
+  const newest = () => queryAll<Record<string, unknown>>(
+    `${select} ORDER BY t.created_at DESC LIMIT ${MAX_TRACKS}`
+  );
 
-  return { tracks: rows.map(mapTrack) };
+  let rows: Record<string, unknown>[];
+  if (tokens.length === 0) {
+    rows = await newest();
+  } else {
+    rows = await keywordRows(tokens, columns, (where) =>
+      queryAll<Record<string, unknown>>(
+        `${select} WHERE ${where.sql} ORDER BY t.created_at DESC LIMIT ${MAX_TRACKS}`,
+        where.params
+      )
+    );
+  }
+
+  let note: string | undefined;
+  if (tokens.length > 0 && rows.length === 0) {
+    rows = await newest();
+    note = 'No keyword match. Showing the newest tracks instead.';
+  }
+
+  return {
+    tracks: rows.map(mapTrack),
+    ...(note ? { matched: false, note } : {}),
+  };
 }
 
 async function searchArticles(query: string): Promise<unknown> {
-  const where = query
-    ? `WHERE published = 1 AND (title LIKE ? ${LIKE_ESCAPE}
-        OR excerpt LIKE ? ${LIKE_ESCAPE}
-        OR category LIKE ? ${LIKE_ESCAPE}
-        OR body LIKE ? ${LIKE_ESCAPE})`
-    : 'WHERE published = 1';
-  const params = query
-    ? [likePattern(query), likePattern(query), likePattern(query), likePattern(query)]
-    : [];
-
-  const rows = await queryAll(`
+  const tokens = searchTokens(query);
+  const columns = ['title', 'excerpt', 'category', 'body'];
+  const select = `
     SELECT id, slug, title, excerpt, category, LEFT(body, 8000) AS body, created_at
-    FROM blog_posts
-    ${where}
-    ORDER BY created_at DESC
-    LIMIT ${MAX_ARTICLES}
-  `, params);
+    FROM blog_posts`;
+  const newest = () => queryAll<Record<string, unknown>>(
+    `${select} WHERE published = 1 ORDER BY created_at DESC LIMIT ${MAX_ARTICLES}`
+  );
 
-  return { articles: rows.map((row) => mapArticle(row, query)) };
+  let rows: Record<string, unknown>[];
+  if (tokens.length === 0) {
+    rows = await newest();
+  } else {
+    rows = await keywordRows(tokens, columns, (where) =>
+      queryAll<Record<string, unknown>>(
+        `${select} WHERE published = 1 AND (${where.sql}) ORDER BY created_at DESC LIMIT ${MAX_ARTICLES}`,
+        where.params
+      )
+    );
+  }
+
+  let note: string | undefined;
+  if (tokens.length > 0 && rows.length === 0) {
+    rows = await newest();
+    note = 'No keyword match. Showing the newest published articles instead.';
+  }
+
+  return {
+    articles: rows.map((row) => mapArticle(row, tokens[0] ?? query)),
+    ...(note ? { matched: false, note } : {}),
+  };
 }
 
 async function listAnnouncements(): Promise<unknown> {

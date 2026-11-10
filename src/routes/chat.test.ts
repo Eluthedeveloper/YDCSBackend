@@ -347,6 +347,17 @@ describe('POST /api/chat', () => {
     expect(res.body.reply).toContain('info@yemisrachdimts.org');
   });
 
+  it('stops at the first quota rejection instead of trying every model', async () => {
+    fetchMock.mockResolvedValue(geminiError(429, 'Quota exceeded for this project'));
+
+    const res = await ask({ messages: [{ role: 'user', text: 'Hello' }] });
+
+    expect(res.status).toBe(429);
+    expect(res.body.error).toContain('info@yemisrachdimts.org');
+    // The fallback models use the same key, so retrying cannot help.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('returns a friendly 502 when every model is down', async () => {
     fetchMock.mockResolvedValue(geminiError(503));
 

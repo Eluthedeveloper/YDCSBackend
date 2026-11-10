@@ -41,6 +41,7 @@ async function seed() {
   const accounts: SeededAccount[] = [
     { username: 'superadmin', email: 'superadmin@audio.com', role: 'super_admin' },
     { username: 'admin', email: 'admin@audio.com', role: 'admin' },
+    { username: 'editor', email: 'editor@audio.com', role: 'editor' },
   ].map((a) => ({ ...a, password: generatePassword() }));
 
   for (const account of accounts) {

@@ -103,11 +103,12 @@ const ADMIN = {
 };
 
 const SUPER = { ...ADMIN, id: 'user-super', username: 'super', role: 'super_admin' };
+const EDITOR = { ...ADMIN, id: 'user-editor', username: 'editor', role: 'editor' };
 
 let app: ReturnType<typeof createApp>['app'];
 
-function cookieFor(role: 'admin' | 'super_admin') {
-  const payload = role === 'admin' ? ADMIN : SUPER;
+function cookieFor(role: 'admin' | 'super_admin' | 'editor') {
+  const payload = role === 'admin' ? ADMIN : role === 'editor' ? EDITOR : SUPER;
   const token = jwt.sign(
     { id: payload.id, username: payload.username, role, tokenVersion: 0 },
     SECRET,
@@ -392,10 +393,10 @@ describe('POST /api/site/albums/:id/photos', () => {
 });
 
 describe('DELETE /api/site permissions', () => {
-  // Removals are super-admin only, so a co-admin account cannot silently wipe
-  // content the public site depends on.
-  it('forbids an admin from deleting an announcement', async () => {
-    authThen({ id: 'n1', title: 'Hello' });
+  // Content belongs to its author: an admin or editor may only delete rows
+  // they created, while a super admin may remove anyone's.
+  it("forbids an admin from deleting another user's announcement", async () => {
+    authThen({ id: 'n1', title: 'Hello', created_by: 'user-other' });
 
     const res = await request(app)
       .delete('/api/site/announcements/n1')
@@ -405,8 +406,51 @@ describe('DELETE /api/site permissions', () => {
     expect(db.runSQL).not.toHaveBeenCalled();
   });
 
+  it('lets an admin delete an announcement they created', async () => {
+    authThen({ id: 'n1', title: 'Hello', created_by: ADMIN.id });
+
+    const res = await request(app)
+      .delete('/api/site/announcements/n1')
+      .set('Cookie', cookieFor('admin'));
+
+    expect(res.status).toBe(200);
+    expect(db.runSQL).toHaveBeenCalled();
+  });
+
+  it('lets an editor delete an announcement they created', async () => {
+    authThen({ id: 'n1', title: 'Hello', created_by: EDITOR.id });
+
+    const res = await request(app)
+      .delete('/api/site/announcements/n1')
+      .set('Cookie', cookieFor('editor'));
+
+    expect(res.status).toBe(200);
+  });
+
+  it('forbids an editor from deleting an event created by someone else', async () => {
+    authThen({ id: 'e1', title: 'Concert', created_by: 'user-other' });
+
+    const res = await request(app)
+      .delete('/api/site/events/e1')
+      .set('Cookie', cookieFor('editor'));
+
+    expect(res.status).toBe(403);
+    expect(db.runSQL).not.toHaveBeenCalled();
+  });
+
+  it('lets an editor delete a blog post they created', async () => {
+    authThen({ id: 'b1', title: 'News', created_by: EDITOR.id });
+
+    const res = await request(app)
+      .delete('/api/site/blog/b1')
+      .set('Cookie', cookieFor('editor'));
+
+    expect(res.status).toBe(200);
+    expect(db.runSQL).toHaveBeenCalled();
+  });
+
   it('lets a super admin delete an announcement and drops its cache', async () => {
-    authThen({ id: 'n1', title: 'Hello' });
+    authThen({ id: 'n1', title: 'Hello', created_by: 'user-other' });
 
     const res = await request(app)
       .delete('/api/site/announcements/n1')

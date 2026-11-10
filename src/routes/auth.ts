@@ -17,7 +17,7 @@ interface UserRow {
   id: string;
   username: string;
   email: string;
-  role: 'super_admin' | 'admin';
+  role: 'super_admin' | 'admin' | 'editor';
 }
 
 interface SeededUserRow extends UserRow {

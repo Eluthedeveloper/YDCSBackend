@@ -7,14 +7,17 @@ import { readToken, setAuthCookie, TOKEN_TTL_SECONDS } from '../lib/authCookie';
 export interface AuthUser {
   id: string;
   username: string;
-  role: 'super_admin' | 'admin';
+  role: 'super_admin' | 'admin' | 'editor';
 }
 
 export interface AuthRequest extends Request {
   user?: AuthUser;
 }
 
-export const ROLES: readonly AuthUser['role'][] = ['super_admin', 'admin'];
+export const ROLES: readonly AuthUser['role'][] = ['super_admin', 'admin', 'editor'];
+
+/** Roles allowed to manage programs, tracks and other site-wide settings. */
+export const FULL_ADMIN_ROLES: readonly AuthUser['role'][] = ['super_admin', 'admin'];
 
 interface TokenPayload extends JwtPayload {
   id: string;
@@ -114,9 +117,30 @@ export function requireAdmin(req: AuthRequest, res: Response, next: NextFunction
     });
   }
 
-  if (!ROLES.includes(req.user.role)) {
+  if (!FULL_ADMIN_ROLES.includes(req.user.role)) {
     return res.status(403).json({
       error: 'Admin access required',
+    });
+  }
+
+  next();
+}
+
+/**
+ * Gate for the announcements / events / blog routes: editors get in, but
+ * everything else keeps using `requireAdmin` so an editor cannot touch
+ * programs, tracks, schedules or users.
+ */
+export function requireContentEditor(req: AuthRequest, res: Response, next: NextFunction) {
+  if (!req.user) {
+    return res.status(401).json({
+      error: 'Authentication required',
+    });
+  }
+
+  if (!ROLES.includes(req.user.role)) {
+    return res.status(403).json({
+      error: 'Content editor access required',
     });
   }
 

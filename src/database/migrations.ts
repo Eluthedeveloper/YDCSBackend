@@ -294,6 +294,37 @@ const CREATE_TABLES: Migration[] = [
       }
     },
   },
+  {
+    // Shortwave broadcast schedule: one row per scheduled transmission (a
+    // frequency beamed at a region at a time of day), unlike the hourly
+    // `radio_schedule` grid, which is addressed by slot. `sort_order` gives
+    // admins explicit control over the listing order.
+    name: '017_create_shortwave_schedule',
+    up: async (conn) => {
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS shortwave_schedule (
+          id VARCHAR(36) PRIMARY KEY,
+          start_time TIME NOT NULL,
+          end_time TIME NULL,
+          frequency_khz INT UNSIGNED NOT NULL,
+          language VARCHAR(64) NULL,
+          target VARCHAR(255) NULL,
+          program VARCHAR(255) NULL,
+          active TINYINT(1) NOT NULL DEFAULT 1,
+          sort_order INT NOT NULL DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      `);
+    },
+  },
+  {
+    name: '018_add_editor_role',
+    up: async (conn) => {
+      await conn.execute(
+        "ALTER TABLE users MODIFY COLUMN role ENUM('super_admin','admin','editor') NOT NULL"
+      );
+    },
+  },
 ];
 
 /**

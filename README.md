@@ -58,10 +58,11 @@ key and the organisation prompt never leave the server.
   exchange so a slow model does not leave the visitor waiting indefinitely.
 - The route trims history to the last 12 turns, caps messages at 1500
   characters, and applies `chatLimiter` (40 messages per 15 minutes per IP).
-- `GEMINI_MODEL` is tried first; if it fails for any reason (quota, overload,
-  timeout, empty response or a bad request), `GEMINI_FALLBACK_MODELS` are tried
-  in order. A safety block is answered calmly instead of being retried on
-  another model.
+- `GEMINI_MODEL` is tried first; if it fails for any reason (overload, timeout,
+  empty response or a bad request), `GEMINI_FALLBACK_MODELS` are tried in
+  order. A quota or rate-limit rejection (HTTP 429) stops immediately and
+  returns 429, because every model shares the same API key. A safety block is
+  answered calmly instead of being retried on another model.
 - Responses are sent with `Cache-Control: no-store` because each conversation
   is specific to one visitor.
 

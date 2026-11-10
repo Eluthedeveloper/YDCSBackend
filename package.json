@@ -6,6 +6,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "seed": "tsx src/database/seed.ts",
+    "check:audio": "tsx src/scripts/check-missing-audio.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

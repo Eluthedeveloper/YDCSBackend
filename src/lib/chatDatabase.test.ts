@@ -33,7 +33,7 @@ describe('chat database tools', () => {
     expect(names).toContain('search_blog_posts');
   });
 
-  it('escapes LIKE wildcards and never returns private columns', async () => {
+  it('keeps wildcard characters out of the pattern and never returns private columns', async () => {
     db.queryAll.mockResolvedValue([{
       id: 'p1',
       title: '100% Prayer',
@@ -54,13 +54,59 @@ describe('chat database tools', () => {
     const [sql, params] = db.queryAll.mock.calls[0];
     expect(sql).toContain('FROM programs');
     expect(sql).toContain('ESCAPE');
-    expect(params).toEqual(['%100!%!_%', '%100!%!_%']);
+    // The query is split into keywords, so `%` and `_` never reach the
+    // pattern; the remaining token is wrapped literally.
+    expect(params).toEqual(['%100%', '%100%']);
 
     const serialised = JSON.stringify(result);
     expect(serialised).not.toContain('private-user-id');
     expect(serialised).not.toContain('/private/audio.mp3');
     expect(serialised).not.toContain('private@example.com');
     expect(serialised).toContain('100% Prayer');
+  });
+
+  it('matches all keywords first, then relaxes to any keyword', async () => {
+    db.queryAll
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'p1', title: 'Morning Prayer', description: null }]);
+
+    const result = await executeChatTool({
+      name: 'search_programs',
+      args: { query: 'programmes about morning prayer' },
+    });
+
+    expect(db.queryAll).toHaveBeenCalledTimes(2);
+    const [, strictParams] = db.queryAll.mock.calls[0];
+    const [looseSql, looseParams] = db.queryAll.mock.calls[1];
+    // "programmes/about" are dropped, leaving two real keywords.
+    expect(strictParams).toEqual(['%morning%', '%morning%', '%prayer%', '%prayer%']);
+    expect(looseSql).toContain(' OR ');
+    expect(looseParams).toEqual(['%morning%', '%morning%', '%prayer%', '%prayer%']);
+    expect(JSON.stringify(result)).toContain('Morning Prayer');
+  });
+
+  it('falls back to the newest rows when no keyword matches', async () => {
+    db.queryAll
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'p1', title: 'Newest Programme', description: null }]);
+
+    const result = await executeChatTool({
+      name: 'search_programs',
+      args: { query: 'prayer' },
+    });
+
+    expect(db.queryAll).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(result)).toContain('Newest Programme');
+    expect(JSON.stringify(result)).toContain('"matched":false');
+    expect(JSON.stringify(result)).toContain('newest programmes');
+  });
+
+  it('lists the newest rows when the query is only filler words', async () => {
+    await executeChatTool({ name: 'search_programs', args: { query: 'programmes about' } });
+
+    expect(db.queryAll).toHaveBeenCalledTimes(1);
+    const [sql] = db.queryAll.mock.calls[0];
+    expect(sql).not.toContain('LIKE');
   });
 
   it('searches only published blog articles', async () => {

@@ -5,7 +5,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import { queryAll, queryOne, runSQL, withTransaction } from '../database/schema';
-import { AuthRequest, authenticate, requireSuperAdmin, requireAdmin } from '../middleware/auth';
+import { AuthRequest, authenticate, requireSuperAdmin, requireAdmin, requireContentEditor } from '../middleware/auth';
 import { browseLimiter, writeLimiter, uploadLimiter } from '../middleware/rateLimit';
 import { cacheGet, cacheSet, cacheDelete } from '../cache/redis';
 import { siteReadCacheKeys, feedReadCacheKeys } from '../lib/cacheKeys';
@@ -125,6 +125,7 @@ interface AnnouncementRow {
   title: string;
   body: string | null;
   pinned: number;
+  created_by: string;
 }
 
 interface EventRow {
@@ -134,6 +135,7 @@ interface EventRow {
   location: string | null;
   starts_at: string;
   ends_at: string | null;
+  created_by: string;
 }
 
 interface BlogRow {
@@ -145,6 +147,7 @@ interface BlogRow {
   category: string | null;
   cover_image: string | null;
   published: number;
+  created_by: string;
   created_at?: string;
   updated_at?: string;
 }
@@ -167,6 +170,14 @@ interface WhatsNewItem {
   image: string | null;
   url: string;
   published_at: string;
+}
+
+/**
+ * Everyone may edit content, but only the author — or a super admin — may
+ * delete it, so an editor cannot wipe a colleague's work.
+ */
+function canDeleteContent(req: AuthRequest, createdBy: string): boolean {
+  return req.user?.role === 'super_admin' || req.user?.id === createdBy;
 }
 
 /**
@@ -503,6 +514,125 @@ router.delete('/schedule/:id', writeLimiter, authenticate, requireSuperAdmin, as
 }));
 
 /* ------------------------------------------------------------------ *
+ * Shortwave schedule
+ * ------------------------------------------------------------------ */
+
+interface ShortwaveRow {
+  id: string;
+  start_time: string;
+  end_time: string | null;
+  frequency_khz: number;
+  language: string | null;
+  target: string | null;
+  program: string | null;
+  active: number;
+  sort_order: number;
+}
+
+/** `HH:MM` or `HH:MM:SS`; returns `HH:MM:SS` for MySQL's TIME column. */
+function coerceTime(raw: unknown): string | null {
+  const m = singleString(raw)?.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return null;
+  const h = Number(m[1]), min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return `${String(h).padStart(2, '0')}:${m[2]}:${m[3] ?? '00'}`;
+}
+
+// International shortwave allocations run ~3 kHz to 30 MHz (30000 kHz).
+function coerceKhz(raw: unknown): number | null {
+  const n = Number(singleString(raw as never));
+  if (!Number.isInteger(n) || n < 100 || n > 30000) return null;
+  return n;
+}
+
+router.get('/shortwave', browseLimiter, asyncHandler(async (_req, res: Response) => {
+  const rows = await cachedList<ShortwaveRow>(siteReadCacheKeys('shortwave')[0], () =>
+    queryAll<ShortwaveRow>('SELECT * FROM shortwave_schedule ORDER BY sort_order ASC, start_time ASC')
+  );
+  res.json(rows);
+}));
+
+const MAX_SHORTWAVE_TEXT = 255;
+const MAX_SHORTWAVE_LANGUAGE = 64;
+
+/** Shared field validation for POST and PUT. Returns a field object or an error string. */
+function validateShortwaveFields(body: Record<string, unknown>) {
+  const start = coerceTime(body.start_time);
+  if (!start) return { error: 'A valid start time (HH:MM) is required' };
+  const end = body.end_time !== undefined && singleString(body.end_time)
+    ? coerceTime(body.end_time)
+    : null;
+  if (body.end_time !== undefined && singleString(body.end_time) && !end) {
+    return { error: 'Invalid end time' };
+  }
+  const frequency = coerceKhz(body.frequency_khz);
+  if (!frequency) return { error: 'Frequency must be an integer from 100 to 30000 kHz' };
+  const language = singleString(body.language) ?? '';
+  if (language.length > MAX_SHORTWAVE_LANGUAGE) {
+    return { error: `Language must be ${MAX_SHORTWAVE_LANGUAGE} characters or fewer` };
+  }
+  const target = singleString(body.target) ?? '';
+  if (target.length > MAX_SHORTWAVE_TEXT) {
+    return { error: `Region must be ${MAX_SHORTWAVE_TEXT} characters or fewer` };
+  }
+  const program = singleString(body.program) ?? '';
+  if (program.length > MAX_SHORTWAVE_TEXT) {
+    return { error: `Program must be ${MAX_SHORTWAVE_TEXT} characters or fewer` };
+  }
+  return {
+    fields: {
+      start,
+      end,
+      frequency,
+      language: language || null,
+      target: target || null,
+      program: program || null,
+      active: body.active !== undefined ? (body.active ? 1 : 0) : 1,
+      sort_order: Number.isInteger(Number(body.sort_order)) ? Number(body.sort_order) : 0,
+    },
+  };
+}
+
+router.post('/shortwave', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+  const result = validateShortwaveFields(req.body ?? {});
+  if ('error' in result) return res.status(400).json({ error: result.error });
+
+  const id = uuidv4();
+  const f = result.fields!;
+  await runSQL(
+    'INSERT INTO shortwave_schedule (id, start_time, end_time, frequency_khz, language, target, program, active, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [id, f.start, f.end, f.frequency, f.language, f.target, f.program, f.active, f.sort_order]
+  );
+  await cacheDelete(...siteReadCacheKeys('shortwave'));
+  res.status(201).json({ id, ...f });
+}));
+
+router.put('/shortwave/:id', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+  const existing = await queryOne<ShortwaveRow>('SELECT * FROM shortwave_schedule WHERE id = ?', [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'Entry not found' });
+
+  const result = validateShortwaveFields(req.body ?? {});
+  if ('error' in result) return res.status(400).json({ error: result.error });
+
+  const f = result.fields!;
+  await runSQL(
+    'UPDATE shortwave_schedule SET start_time = ?, end_time = ?, frequency_khz = ?, language = ?, target = ?, program = ?, active = ?, sort_order = ? WHERE id = ?',
+    [f.start, f.end, f.frequency, f.language, f.target, f.program, f.active, f.sort_order, req.params.id]
+  );
+  await cacheDelete(...siteReadCacheKeys('shortwave'));
+  res.json({ message: 'Entry updated' });
+}));
+
+router.delete('/shortwave/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
+  const existing = await queryOne<{ id: string }>('SELECT id FROM shortwave_schedule WHERE id = ?', [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'Entry not found' });
+
+  await runSQL('DELETE FROM shortwave_schedule WHERE id = ?', [req.params.id]);
+  await cacheDelete(...siteReadCacheKeys('shortwave'));
+  res.json({ message: 'Entry deleted' });
+}));
+
+/* ------------------------------------------------------------------ *
  * Blog
  * ------------------------------------------------------------------ */
 
@@ -522,7 +652,7 @@ router.get('/blog', browseLimiter, asyncHandler(async (_req, res: Response) => {
 }));
 
 // Registered before /blog/:slug so "admin" is never parsed as a slug.
-router.get('/blog/admin', authenticate, requireAdmin, asyncHandler(async (_req, res: Response) => {
+router.get('/blog/admin', authenticate, requireContentEditor, asyncHandler(async (_req, res: Response) => {
   const posts = await withBlogImages(
     await queryAll<BlogRow>('SELECT * FROM blog_posts ORDER BY created_at DESC LIMIT ?', [MAX_ROWS])
   );
@@ -899,7 +1029,7 @@ router.delete('/albums/:albumId/photos/:photoId', writeLimiter, authenticate, re
  * Announcements
  * ------------------------------------------------------------------ */
 
-router.post('/announcements', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.post('/announcements', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
   const { title, body, pinned } = req.body ?? {};
 
   const cleanTitle = singleString(title);
@@ -921,7 +1051,7 @@ router.post('/announcements', writeLimiter, authenticate, requireAdmin, asyncHan
   res.status(201).json({ id, title: cleanTitle, body: cleanBody || null, pinned: isPinned });
 }));
 
-router.put('/announcements/:id', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.put('/announcements/:id', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
   const announcement = await queryOne<AnnouncementRow>('SELECT * FROM announcements WHERE id = ?', [req.params.id]);
   if (!announcement) return res.status(404).json({ error: 'Announcement not found' });
 
@@ -950,9 +1080,12 @@ router.put('/announcements/:id', writeLimiter, authenticate, requireAdmin, async
   res.json({ message: 'Announcement updated' });
 }));
 
-router.delete('/announcements/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
+router.delete('/announcements/:id', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
   const announcement = await queryOne<AnnouncementRow>('SELECT * FROM announcements WHERE id = ?', [req.params.id]);
   if (!announcement) return res.status(404).json({ error: 'Announcement not found' });
+  if (!canDeleteContent(req, announcement.created_by)) {
+    return res.status(403).json({ error: 'You can only delete announcements you created' });
+  }
 
   await runSQL('DELETE FROM announcements WHERE id = ?', [req.params.id]);
   await cacheDelete(...feedReadCacheKeys('announcements'));
@@ -963,7 +1096,7 @@ router.delete('/announcements/:id', writeLimiter, authenticate, requireSuperAdmi
  * Events
  * ------------------------------------------------------------------ */
 
-router.post('/events', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.post('/events', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
   const { title, description, location, starts_at, ends_at } = req.body ?? {};
 
   const cleanTitle = singleString(title);
@@ -1003,7 +1136,7 @@ router.post('/events', writeLimiter, authenticate, requireAdmin, asyncHandler(as
   });
 }));
 
-router.put('/events/:id', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.put('/events/:id', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
   const event = await queryOne<EventRow>('SELECT * FROM events WHERE id = ?', [req.params.id]);
   if (!event) return res.status(404).json({ error: 'Event not found' });
 
@@ -1054,9 +1187,12 @@ router.put('/events/:id', writeLimiter, authenticate, requireAdmin, asyncHandler
   res.json({ message: 'Event updated' });
 }));
 
-router.delete('/events/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
+router.delete('/events/:id', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
   const event = await queryOne<EventRow>('SELECT * FROM events WHERE id = ?', [req.params.id]);
   if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (!canDeleteContent(req, event.created_by)) {
+    return res.status(403).json({ error: 'You can only delete events you created' });
+  }
 
   await runSQL('DELETE FROM events WHERE id = ?', [req.params.id]);
   await cacheDelete(...feedReadCacheKeys('events'));
@@ -1073,7 +1209,7 @@ function blogUploadFields(req: AuthRequest): { cover?: Express.Multer.File; gall
   return { cover: files.cover?.[0], gallery: files.images ?? [] };
 }
 
-router.post('/blog', writeLimiter, authenticate, requireAdmin, uploadLimiter, blogUpload.fields([
+router.post('/blog', writeLimiter, authenticate, requireContentEditor, uploadLimiter, blogUpload.fields([
   { name: 'cover', maxCount: 1 },
   { name: 'images', maxCount: MAX_BLOG_IMAGES },
 ]), asyncHandler(async (req: AuthRequest, res: Response) => {
@@ -1138,7 +1274,7 @@ router.post('/blog', writeLimiter, authenticate, requireAdmin, uploadLimiter, bl
   });
 }));
 
-router.put('/blog/:id', writeLimiter, authenticate, requireAdmin, uploadLimiter, blogUpload.fields([
+router.put('/blog/:id', writeLimiter, authenticate, requireContentEditor, uploadLimiter, blogUpload.fields([
   { name: 'cover', maxCount: 1 },
   { name: 'images', maxCount: MAX_BLOG_IMAGES },
 ]), asyncHandler(async (req: AuthRequest, res: Response) => {
@@ -1212,9 +1348,12 @@ router.put('/blog/:id', writeLimiter, authenticate, requireAdmin, uploadLimiter,
   res.json({ message: 'Post updated' });
 }));
 
-router.delete('/blog/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res) => {
+router.delete('/blog/:id', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
   const post = await queryOne<BlogRow>('SELECT * FROM blog_posts WHERE id = ?', [req.params.id]);
   if (!post) return res.status(404).json({ error: 'Post not found' });
+  if (!canDeleteContent(req, post.created_by)) {
+    return res.status(403).json({ error: 'You can only delete posts you created' });
+  }
 
   const images = await queryAll<BlogImageRow>('SELECT image FROM blog_images WHERE blog_post_id = ?', [
     post.id,
@@ -1225,17 +1364,6 @@ router.delete('/blog/:id', writeLimiter, authenticate, requireSuperAdmin, asyncH
   await runSQL('DELETE FROM blog_posts WHERE id = ?', [req.params.id]);
   removeUpload('blogs', post.cover_image);
   for (const row of images) removeUpload('blogs', row.image);
-
-  await cacheDelete(...feedReadCacheKeys('blog'));
-  res.json({ message: 'Post deleted' });
-}));
-
-router.delete('/blog/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
-  const post = await queryOne<BlogRow>('SELECT * FROM blog_posts WHERE id = ?', [req.params.id]);
-  if (!post) return res.status(404).json({ error: 'Post not found' });
-
-  await runSQL('DELETE FROM blog_posts WHERE id = ?', [req.params.id]);
-  removeUpload('blogs', post.cover_image);
 
   await cacheDelete(...feedReadCacheKeys('blog'));
   res.json({ message: 'Post deleted' });

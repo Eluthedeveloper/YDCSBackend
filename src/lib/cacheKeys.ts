@@ -30,7 +30,7 @@ export function programReadCacheKeys(programId?: string): string[] {
  * flushes the other caches.
  */
 export function siteReadCacheKeys(
-  resource?: 'leaders' | 'albums' | 'announcements' | 'events' | 'blog' | 'whats-new' | 'schedule'
+  resource?: 'leaders' | 'albums' | 'announcements' | 'events' | 'blog' | 'whats-new' | 'schedule' | 'shortwave'
 ): string[] {
   const keys = {
     leaders: 'public:site:leaders',
@@ -40,6 +40,7 @@ export function siteReadCacheKeys(
     blog: 'public:site:blog',
     'whats-new': 'public:site:whats-new',
     schedule: 'public:site:schedule',
+    shortwave: 'public:site:shortwave',
   } as const;
   return resource ? [keys[resource]] : Object.values(keys);
 }
