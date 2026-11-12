@@ -96,8 +96,7 @@ describe('GET /api/uploads/:type/:filename', () => {
   });
 
   // Images must keep the extension-driven Content-Type; the internal location
-  // disables mime mapping (neutral octet-stream for audio), so offloading them
-  // would break <img> rendering.
+  // maps the audio extensions, so offloading images would break <img> rendering.
   it('keeps serving images through Node even when X-Accel-Redirect is enabled', async () => {
     process.env.X_ACCEL_PREFIX = '/__media';
     try {
@@ -204,9 +203,9 @@ describe('GET /api/uploads/:type/:filename', () => {
   // The player streams from `<uuid>.stream` so IDM has no file extension to
   // build a download task around. The stem has to resolve back to the real file
   // on disk, and the response must stay byte-range capable for seeking. The
-  // declared type is deliberately neutral (not `audio/*`) so a download manager
-  // sniffing Content-Type has no media type to name a capture after; the
-  // browser decodes the audio from the bytes regardless.
+  // declared type is the real audio type: a media element whose response is
+  // not typed as audio is refused by iOS Safari, which left playback stuck
+  // there. `STREAM_CONTENT_TYPE=neutral` restores the old neutral answer.
   it('resolves an extensionless .stream name back to the audio file', async () => {
     const res = await request(app)
       .get('/api/uploads/tracks/vitest-audio.stream')
@@ -218,10 +217,24 @@ describe('GET /api/uploads/:type/:filename', () => {
       });
 
     expect(res.status).toBe(200);
-    expect(res.headers['content-type']).toContain('application/octet-stream');
+    expect(res.headers['content-type']).toContain('audio/mpeg');
     expect(res.headers['accept-ranges']).toBe('bytes');
     expect(res.headers['content-disposition']).toBe('inline');
     expect(asBuffer(res)).toBe('A'.repeat(1000));
+  });
+
+  // The neutral answer is still available for a deployment that would rather
+  // have the download-manager behaviour than iOS playback.
+  it('can be switched back to a neutral content type', async () => {
+    process.env.STREAM_CONTENT_TYPE = 'neutral';
+    try {
+      const res = await request(app).get('/api/uploads/tracks/vitest-audio.stream');
+
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toContain('application/octet-stream');
+    } finally {
+      delete process.env.STREAM_CONTENT_TYPE;
+    }
   });
 
   it('still honours byte ranges on a .stream URL so seeking works', async () => {
@@ -247,7 +260,7 @@ describe('GET /api/uploads/:type/:filename', () => {
     const res = await request(app).get('/api/uploads/tracks/vitest-shouty.stream');
 
     expect(res.status).toBe(200);
-    expect(res.headers['content-type']).toContain('application/octet-stream');
+    expect(res.headers['content-type']).toContain('audio/mpeg');
   });
 
   it('returns 404 for a .stream stem with no matching file', async () => {

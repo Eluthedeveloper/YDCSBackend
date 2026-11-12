@@ -31,6 +31,7 @@ placeholders. Never commit the filled-in file. One `.env` serves both
 | `GEMINI_API_KEY` | Visitor chatbot. Server-side only; never expose it to the browser |
 | `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS` | Optional model overrides for the chatbot |
 | `UPLOAD_CHUNK_BYTES` | Bytes per audio upload chunk. Default 512 KB, which fits under nginx's stock 1 MB body cap. Raise it only when the front proxy allows larger bodies |
+| `STREAM_CONTENT_TYPE` | Content-Type for the extensionless `.stream` audio URLs. `audio` (default) declares the real audio type — required, because iOS Safari will not decode a media element whose response is not typed as audio. `neutral` restores the old `application/octet-stream` answer |
 | `NODE_ENV` | `production` marks session cookies `secure` |
 
 The CORS allowlist in `src/index.ts` is an explicit origin list, not an

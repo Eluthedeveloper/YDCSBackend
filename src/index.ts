@@ -43,19 +43,37 @@ const INLINE_HEADERS = { 'Content-Disposition': 'inline' } as const;
 
 // INLINE_HEADERS alone is not enough. IDM first looks at the extension in the
 // URL, and when that is unrecognisable it falls back to the response
-// Content-Type — that is how a bare `.ts` module URL got saved as `metadata.JS`,
-// and how a `.stream` URL answered as `audio/mpeg` came back as a capture
-// prompt named `<uuid>.mp3`.
+// Content-Type — that is how a bare `.ts` module URL got saved as `metadata.JS`.
 //
-// Audio is therefore streamed from an extensionless `<uuid>.stream` URL, and
-// that URL is answered with a neutral Content-Type instead of `audio/*`.
-// Browsers decode media from the bytes themselves, so playback is unaffected,
-// while download managers no longer see a media type to name a download after.
-// The file on disk keeps its real extension, so the stem is resolved back to it
-// against the list below.
+// Audio is therefore streamed from an extensionless `<uuid>.stream` URL, which
+// leaves IDM no extension to build a download task around. The response still
+// declares the real audio type, because a media element that is not typed as
+// audio is refused outright by iOS Safari. The file on disk keeps its real
+// extension, so the stem is resolved back to it against the list below.
 const STREAM_SUFFIX = '.stream';
 
 const AUDIO_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac'];
+
+/**
+ * What a `.stream` URL answers with.
+ *
+ * The extensionless URL is what keeps download managers from offering to save
+ * every track the player streams. The neutral `application/octet-stream` type
+ * was the second half of that defence, but it costs far more than it saves:
+ * iOS Safari refuses to decode a media element whose response is not typed as
+ * audio, so playback never starts there at all, and the browser reports it as
+ * a generic failure the listener cannot act on.
+ *
+ * Mobile listeners are the ministry's audience; an IDM capture prompt is one
+ * desktop annoyance. The real audio type is therefore sent by default.
+ * `STREAM_CONTENT_TYPE=neutral` restores the old octet-stream answer.
+ *
+ * Read per request rather than once at import, so a deployment can be switched
+ * without a rebuild and a test can exercise both answers.
+ */
+function streamContentTypeIsNeutral(): boolean {
+  return (process.env.STREAM_CONTENT_TYPE || 'audio').toLowerCase() === 'neutral';
+}
 
 /**
  * Maps a request filename to a real file in `typeRoot`, or null if there is
@@ -233,13 +251,17 @@ export function createApp() {
 
     // Derived from the file that was actually found, not from the request name:
     // a `.stream` request still needs byte ranges accepted, and the real type
-    // decides that. The declared type is neutral for `.stream` names so no
-    // Content-Type header tells a download manager this is media.
+    // decides that. The URL stays extensionless so a download manager has no
+    // media extension to name a capture after.
     const ext = path.extname(resolved).toLowerCase();
     const realType = MIME_TYPES[ext] || 'application/octet-stream';
     const isAudio = realType.startsWith('audio/');
     const isStreamRequest = safeFilename.toLowerCase().endsWith(STREAM_SUFFIX);
-    const contentType = isStreamRequest ? 'application/octet-stream' : realType;
+    // The URL stays extensionless (IDM looks at the extension first); the type
+    // is the real audio type unless the deployment opts back into the neutral
+    // answer. See STREAM_CONTENT_TYPE for why.
+    const contentType =
+      isStreamRequest && streamContentTypeIsNeutral() ? 'application/octet-stream' : realType;
 
     fsSync.stat(resolved, (err, stat) => {
       if (err || !stat.isFile()) {
@@ -253,8 +275,9 @@ export function createApp() {
       // (whole-file and seek) streaming load disappear.
       //
       // Only audio takes this path: images need the extension-driven
-      // Content-Type that the internal location deliberately disables (it
-      // forces the neutral octet-stream type the `.stream` URLs depend on).
+      // Content-Type, and the internal location maps audio extensions to their
+      // real type (a neutral octet-stream answer would stop iOS Safari from
+      // decoding the stream at all).
       // Unset X_ACCEL_PREFIX to fall back to streaming through Node.
       const accelPrefix = process.env.X_ACCEL_PREFIX;
       if (isAudio && accelPrefix) {
