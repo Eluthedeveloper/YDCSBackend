@@ -37,6 +37,17 @@ describe('server', () => {
     expect(res.headers['access-control-allow-credentials']).toBe('true');
   });
 
+  it('allows credentialed requests from the stream subdomain', async () => {
+    const res = await request(app)
+      .get('/api/public/programs')
+      .set('Origin', 'https://listen.yemisrachdimts.org');
+
+    expect(res.headers['access-control-allow-origin']).toBe(
+      'https://listen.yemisrachdimts.org'
+    );
+    expect(res.headers['access-control-allow-credentials']).toBe('true');
+  });
+
   it('does not reflect an unknown origin', async () => {
     const res = await request(app)
       .get('/api/public/programs')

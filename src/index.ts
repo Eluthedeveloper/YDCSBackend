@@ -153,6 +153,10 @@ export function createApp() {
       origin: [
         'https://yemisrachdimts.org',
         'https://www.yemisrachdimts.org',
+        // The streaming app's subdomain. Normally same-origin through the
+        // frontend nginx /api/ proxy, allowlisted for builds that point the
+        // client straight at this API instead.
+        'https://listen.yemisrachdimts.org',
         'http://localhost:5173',
       ],
       methods: ['GET', 'POST', 'PUT', 'DELETE'],
