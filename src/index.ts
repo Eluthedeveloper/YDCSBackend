@@ -176,6 +176,13 @@ export function createApp() {
     if (req.method === 'GET' && req.originalUrl.startsWith('/api/uploads/')) {
       return next();
     }
+    // Chunk uploads are exempt too: they are counted by chunkLimiter, which
+    // is sized for the number of chunks a file needs. Counting them here as
+    // well made the 500-per-15-minutes general limit trip halfway through a
+    // single large upload, because one file is hundreds of chunk requests.
+    if (req.method === 'POST' && req.originalUrl.startsWith('/api/tracks/upload/chunk/')) {
+      return next();
+    }
     generalLimiter(req, res, next);
   });
 
