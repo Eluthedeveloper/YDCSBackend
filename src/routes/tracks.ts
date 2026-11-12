@@ -67,10 +67,29 @@ const UPLOADS_ROOT = path.resolve(process.cwd(), 'uploads');
 const TMP_ROOT = path.join(UPLOADS_ROOT, 'tmp');
 const TRACKS_ROOT = path.join(UPLOADS_ROOT, 'tracks');
 
-// Fixed chunk size the client must use. 5 MB stays under nginx's 200 MB body
-// cap with huge headroom, finishes quickly on a slow uplink, and keeps each
-// request well under any reverse-proxy idle timeout.
-const CHUNK_SIZE = 5 * 1024 * 1024;
+// Fixed chunk size the client must use. The client always takes this value
+// from the init response, so the two sides can never disagree.
+//
+// The default is 512 KB, not 5 MB, because nginx's stock `client_max_body_size`
+// is 1 MB. The host-level proxy that terminates TLS in front of this stack
+// usually keeps that default, and it rejects an oversized body itself: the
+// chunk never reaches Express, the proxy answers with its own HTML 413, and
+// the upload UI reports "Chunk 0 failed (HTTP 413)". A chunk that fits under
+// 1 MB uploads fine without touching the proxy config.
+//
+// Raise UPLOAD_CHUNK_BYTES once the front proxy is configured to accept more
+// (the in-container nginx allows 200m); 5 MB is a good value there.
+const DEFAULT_CHUNK_SIZE = 512 * 1024;
+const MIN_CHUNK_SIZE = 64 * 1024;
+const MAX_CHUNK_SIZE = 20 * 1024 * 1024;
+
+function resolveChunkSize(): number {
+  const configured = Number(process.env.UPLOAD_CHUNK_BYTES);
+  if (!Number.isInteger(configured) || configured <= 0) return DEFAULT_CHUNK_SIZE;
+  return Math.min(Math.max(configured, MIN_CHUNK_SIZE), MAX_CHUNK_SIZE);
+}
+
+const CHUNK_SIZE = resolveChunkSize();
 const MAX_AUDIO_BYTES = 100 * 1024 * 1024;
 // upload_id is a server-generated UUID; anything else never touches the FS.
 const UPLOAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

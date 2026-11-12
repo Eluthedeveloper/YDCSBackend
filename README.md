@@ -30,6 +30,7 @@ placeholders. Never commit the filled-in file. One `.env` serves both
 | `SMTP_*`, `CONTACT_*` | Contact form delivery; use a Gmail App Password |
 | `GEMINI_API_KEY` | Visitor chatbot. Server-side only; never expose it to the browser |
 | `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS` | Optional model overrides for the chatbot |
+| `UPLOAD_CHUNK_BYTES` | Bytes per audio upload chunk. Default 512 KB, which fits under nginx's stock 1 MB body cap. Raise it only when the front proxy allows larger bodies |
 | `NODE_ENV` | `production` marks session cookies `secure` |
 
 The CORS allowlist in `src/index.ts` is an explicit origin list, not an
@@ -80,6 +81,15 @@ redeploying.
   plain HTTP, so a plain-HTTP production host means no login at all.
 - nginx proxies `/api/` to the backend with buffering disabled so HTTP Range
   requests reach the browser intact and audio seeking keeps working.
+- **The proxy in front of the API must allow request bodies larger than one
+  upload chunk.** nginx ships with `client_max_body_size 1m`, and a proxy left
+  at that default rejects every chunk itself with its own HTML `413` — the
+  request never reaches Express, so the API logs nothing and the upload UI
+  only reports "Chunk 0 failed (HTTP 413)". The in-container nginx
+  (`frontend/nginx.conf`) sets `client_max_body_size 200m`, but the host-level
+  proxy that terminates TLS in front of the container needs the same setting.
+  Audio uploads work without touching that proxy because the chunk size
+  defaults to 512 KB, which fits under the 1 MB default.
 - Existing credentials that were ever committed should be rotated: change the
   database passwords, `JWT_SECRET`, and the SMTP app password.
 

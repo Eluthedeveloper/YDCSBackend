@@ -49,6 +49,10 @@ services:
       DB_USER: ${MYSQL_USER:-audio}
       DB_PASSWORD: ${MYSQL_PASSWORD:-audio}
       DB_NAME: ${MYSQL_DATABASE:-audiostreaming}
+      # Bytes per audio upload chunk. Empty keeps the server default (512 KB),
+      # which fits under nginx's stock 1 MB body cap. Raise it only when the
+      # proxy in front of this stack allows larger request bodies.
+      UPLOAD_CHUNK_BYTES: "${UPLOAD_CHUNK_BYTES:-}"
       REDIS_ENABLED: "${REDIS_ENABLED:-true}"
       REDIS_HOST: redis
       REDIS_PORT: "6379"

@@ -63,10 +63,14 @@ export const uploadLimiter = limiter({
 });
 
 
+// Chunk requests are counted per chunk, so the ceiling has to cover the worst
+// case the upload UI allows: 50 files of 100 MB each at the smallest chunk
+// size is 10 000 requests, plus retries. The cap is still bounded per IP per
+// hour, and every request is limited to one chunk of bytes.
 export const chunkLimiter = limiter({
   prefix: 'chunk',
   windowMs: 60 * 60 * 1000,
-  max: 3000,
+  max: 25000,
   message: 'Upload limit reached, try again later.',
 });
 
