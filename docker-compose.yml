@@ -66,6 +66,10 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
       GEMINI_FALLBACK_MODELS: ${GEMINI_FALLBACK_MODELS:-gemini-3.5-flash,gemini-3.8-flash}
+      # Audio is handed to nginx via X-Accel-Redirect (the frontend container
+      # has ./uploads mounted read-only at /srv/uploads), so Node never copies
+      # streamed bytes. Unset this to fall back to streaming through Node.
+      X_ACCEL_PREFIX: "${X_ACCEL_PREFIX:-/__media}"
     volumes:
       # Bind mount, not a named volume. The backend also runs outside Docker on
       # the host against this same database, so a named volume would give the
@@ -96,6 +100,10 @@ services:
       - "127.0.0.1:${WEB_PORT:-8080}:80"
     depends_on:
       - backend
+    volumes:
+      # Read-only copy of the uploads directory so nginx can answer the
+      # X-Accel-Redirect audio requests straight from disk.
+      - ./uploads:/srv/uploads:ro
 
 volumes:
   mysql_data:

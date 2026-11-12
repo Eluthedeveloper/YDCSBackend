@@ -238,6 +238,28 @@ export function createApp() {
       if (err || !stat.isFile()) {
         return res.status(404).json({ error: 'File not found' });
       }
+
+      // Offload the bytes to nginx. Express answers with a header only and the
+      // frontend nginx — which has the uploads directory mounted read-only —
+      // streams the file itself, so Node never copies a byte of audio. Range
+      // requests are answered by nginx too, which is what makes the double
+      // (whole-file and seek) streaming load disappear.
+      //
+      // Only audio takes this path: images need the extension-driven
+      // Content-Type that the internal location deliberately disables (it
+      // forces the neutral octet-stream type the `.stream` URLs depend on).
+      // Unset X_ACCEL_PREFIX to fall back to streaming through Node.
+      const accelPrefix = process.env.X_ACCEL_PREFIX;
+      if (isAudio && accelPrefix) {
+        return res
+          .status(200)
+          .set(
+            'X-Accel-Redirect',
+            `${accelPrefix.replace(/\/+$/, '')}/${type}/${encodeURIComponent(path.basename(resolved))}`
+          )
+          .end();
+      }
+
       const fileSize = stat.size;
       const range = req.headers.range;
 

@@ -79,6 +79,38 @@ describe('GET /api/uploads/:type/:filename', () => {
     expect(res.headers['content-disposition']).toBe('inline');
   });
 
+  // In production nginx streams the bytes; Express only names the file so the
+  // internal location can serve it. The `.stream` name must resolve to the real
+  // file on disk, exactly as the Node streaming path does.
+  it('hands audio to nginx via X-Accel-Redirect when the prefix is set', async () => {
+    process.env.X_ACCEL_PREFIX = '/__media';
+    try {
+      const res = await request(app).get('/api/uploads/tracks/vitest-audio.stream');
+
+      expect(res.status).toBe(200);
+      expect(res.headers['x-accel-redirect']).toBe('/__media/tracks/vitest-audio.mp3');
+      expect(res.text ?? '').toBe('');
+    } finally {
+      delete process.env.X_ACCEL_PREFIX;
+    }
+  });
+
+  // Images must keep the extension-driven Content-Type; the internal location
+  // disables mime mapping (neutral octet-stream for audio), so offloading them
+  // would break <img> rendering.
+  it('keeps serving images through Node even when X-Accel-Redirect is enabled', async () => {
+    process.env.X_ACCEL_PREFIX = '/__media';
+    try {
+      const res = await request(app).get('/api/uploads/covers/vitest-cover.png');
+
+      expect(res.status).toBe(200);
+      expect(res.headers['x-accel-redirect']).toBeUndefined();
+      expect(res.headers['content-type']).toContain('image/png');
+    } finally {
+      delete process.env.X_ACCEL_PREFIX;
+    }
+  });
+
   it('honours a byte range so audio seeking works', async () => {
     const res = await request(app)
       .get('/api/uploads/tracks/vitest-audio.mp3')
