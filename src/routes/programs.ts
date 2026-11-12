@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs/promises';
-import { queryAll, queryOne, runSQL } from '../database/schema';
+import { queryAll, queryOne, runSQL, withTransaction } from '../database/schema';
 import { AuthRequest, authenticate, requireSuperAdmin, requireAdmin } from '../middleware/auth';
 import { writeLimiter, uploadLimiter } from '../middleware/rateLimit';
 import { cacheDelete } from '../cache/redis';
@@ -73,6 +73,13 @@ function removeCover(filename?: string | null) {
  */
 const MAX_PAGE_SIZE = 200;
 
+/**
+ * Ceiling for one reorder payload. The admin UI always sends the whole library,
+ * so this only exists to stop an oversized body from turning into hundreds of
+ * UPDATE statements.
+ */
+const MAX_REORDER = 500;
+
 /** Clamps `?limit`/`?offset` to server-chosen bounds. */
 function pagination(query: Record<string, unknown>): { limit: number; offset: number } {
   const rawLimit = Number.parseInt(String(query.limit ?? ''), 10);
@@ -90,7 +97,7 @@ router.get('/', authenticate, requireAdmin, asyncHandler(async (req, res: Respon
       (SELECT COUNT(*) FROM tracks WHERE program_id = p.id) as track_count
     FROM programs p
     JOIN users u ON p.created_by = u.id
-    ORDER BY p.created_at DESC
+    ORDER BY p.sort_order ASC, p.created_at DESC
     LIMIT ? OFFSET ?
   `, [limit, offset]);
   res.json(programs);
@@ -153,8 +160,14 @@ router.post('/', authenticate, requireAdmin, uploadLimiter, uploadCover.single('
     const id = uuidv4();
     const cover_image = req.file ? req.file.filename : null;
 
-    await runSQL('INSERT INTO programs (id, title, description, cover_image, created_by) VALUES (?, ?, ?, ?, ?)',
-      [id, cleanTitle, cleanDescription || null, cover_image, req.user!.id]);
+    // New programmes land at the end of the admin's arrangement rather than at
+    // the top, so creating one never silently displaces a curated order.
+    const last = await queryOne<{ next_order: number }>(
+      'SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order FROM programs'
+    );
+
+    await runSQL('INSERT INTO programs (id, title, description, cover_image, sort_order, created_by) VALUES (?, ?, ?, ?, ?, ?)',
+      [id, cleanTitle, cleanDescription || null, cover_image, last?.next_order ?? 1, req.user!.id]);
 
     await cacheDelete(...programReadCacheKeys(id));
     res.status(201).json({ id, title: cleanTitle, description, cover_image, created_by: req.user!.id });
@@ -162,6 +175,50 @@ router.post('/', authenticate, requireAdmin, uploadLimiter, uploadCover.single('
     removeCover(req.file?.filename);
     throw err;
   }
+}));
+
+/**
+ * Saves the admin's programme order.
+ *
+ * The body is the full, ordered list of programme ids; positions are rewritten
+ * 1..n inside a transaction so a half-applied reorder can never leave the
+ * library shuffled. Registered before `PUT /:id` so "reorder" is never parsed
+ * as a programme id.
+ */
+router.put('/reorder', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req, res: Response) => {
+  const raw = (req.body ?? {}).order;
+  if (!Array.isArray(raw)) {
+    return res.status(400).json({ error: 'order must be an array of program ids' });
+  }
+  const ids = raw.map((value) => singleString(value));
+  if (ids.length === 0 || ids.some((id) => !id)) {
+    return res.status(400).json({ error: 'order must be a non-empty array of program ids' });
+  }
+  if (ids.length > MAX_REORDER) {
+    return res.status(400).json({ error: `At most ${MAX_REORDER} programs can be reordered at once` });
+  }
+  if (new Set(ids).size !== ids.length) {
+    return res.status(400).json({ error: 'order contains duplicate ids' });
+  }
+
+  const order = ids as string[];
+  const placeholders = order.map(() => '?').join(', ');
+  const existing = await queryAll<{ id: string }>(
+    `SELECT id FROM programs WHERE id IN (${placeholders})`,
+    order
+  );
+  if (existing.length !== order.length) {
+    return res.status(400).json({ error: 'order contains an unknown program id' });
+  }
+
+  await withTransaction(async (conn) => {
+    for (let index = 0; index < order.length; index++) {
+      await conn.execute('UPDATE programs SET sort_order = ? WHERE id = ?', [index + 1, order[index]]);
+    }
+  });
+
+  await cacheDelete(...programReadCacheKeys());
+  res.json({ message: 'Program order saved' });
 }));
 
 router.put('/:id', authenticate, requireAdmin, uploadLimiter, uploadCover.single('cover_image'), asyncHandler(async (req: AuthRequest, res: Response) => {

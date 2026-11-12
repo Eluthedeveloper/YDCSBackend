@@ -63,7 +63,7 @@ router.get('/programs', asyncHandler(async (_req, res: Response) => {
       (SELECT COUNT(*) FROM likes l JOIN tracks t ON l.track_id = t.id WHERE t.program_id = p.id) as like_count
     FROM programs p
     JOIN users u ON p.created_by = u.id
-    ORDER BY p.created_at DESC
+    ORDER BY p.sort_order ASC, p.created_at DESC
   `);
 
   await cacheSet('public:programs', programs, CACHE_TTL);

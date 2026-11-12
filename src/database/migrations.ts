@@ -325,6 +325,33 @@ const CREATE_TABLES: Migration[] = [
       );
     },
   },
+  {
+    // Admin-controlled display order for the programme library, so the covers
+    // can be arranged deliberately instead of by upload date. Existing rows are
+    // numbered newest-first, which is exactly how the library was ordered
+    // before, so the first run does not reshuffle anything. Only rows still at
+    // 0 are numbered, which keeps a partially-applied install idempotent.
+    name: '019_add_programs_sort_order',
+    up: async (conn) => {
+      try {
+        await conn.execute(
+          'ALTER TABLE programs ADD COLUMN sort_order INT NOT NULL DEFAULT 0 AFTER cover_image'
+        );
+      } catch (e: any) {
+        // 1060 = duplicate column: an earlier run already added it.
+        if (e.errno !== 1060 && e.errno !== 1061) throw e;
+      }
+      await conn.execute(`
+        UPDATE programs p
+        JOIN (
+          SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rn
+          FROM programs
+        ) ranked ON ranked.id = p.id
+        SET p.sort_order = ranked.rn
+        WHERE p.sort_order = 0
+      `);
+    },
+  },
 ];
 
 /**
@@ -382,6 +409,7 @@ const CREATE_INDEXES: Migration[] = [
   'CREATE INDEX idx_tracks_type ON tracks(track_type)',
   'CREATE INDEX idx_programs_created ON programs(created_at DESC)',
   'CREATE INDEX idx_programs_creator ON programs(created_by)',
+  'CREATE INDEX idx_programs_sort ON programs(sort_order, created_at DESC)',
   'CREATE INDEX idx_comments_program ON comments(program_id)',
   'CREATE INDEX idx_comments_created ON comments(created_at DESC)',
   'CREATE INDEX idx_likes_track ON likes(track_id)',
