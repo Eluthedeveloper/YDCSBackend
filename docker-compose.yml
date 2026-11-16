@@ -112,7 +112,12 @@ services:
       # Read-only copy of the uploads directory so nginx can answer the
       # X-Accel-Redirect audio requests straight from disk.
       - ./uploads:/srv/uploads:ro
+      # Persistent HTML volume: the entrypoint merges each new build over it
+      # without deleting, so lazy chunks from older deploys remain served and
+      # tabs running the previous bundle never 404 on a dynamic import.
+      - html_data:/usr/share/nginx/html
 
 volumes:
   mysql_data:
   redis_data:
+  html_data:
