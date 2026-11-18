@@ -38,3 +38,5 @@ export function coerceDuration(value: unknown, fallback: number): number | null 
 export const MAX_TITLE = 255;
 export const MAX_ARTIST = 255;
 export const MAX_ALBUM = 255;
+// Mirrors tracks.group_name; one label per section inside a program.
+export const MAX_GROUP = 120;

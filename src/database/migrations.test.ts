@@ -1,33 +1,35 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MIGRATIONS, runMigrations } from './migrations';
-import type { PoolConnection } from 'mysql2/promise';
 
-function fakeConn() {
+interface FakeConnOptions {
+  appliedNames?: string[];
+  acquired?: number;
+  failOn?: RegExp;
+}
+
+function fakeConn(opts: FakeConnOptions = {}) {
+  const { appliedNames = [], acquired = 1, failOn } = opts;
   const calls: string[] = [];
   const conn = {
     execute: vi.fn(async (sql: string) => {
       calls.push(sql.replace(/\s+/g, ' ').trim());
+      if (/GET_LOCK/.test(sql)) return [[{ acquired }], []];
+      if (/FROM schema_migrations/.test(sql)) {
+        return [appliedNames.map((name) => ({ name })), []];
+      }
+      if (failOn && failOn.test(sql)) throw new Error('syntax error');
       return [{ affectedRows: 0 }, []];
     }),
+    release: vi.fn(),
   };
-  return { conn: conn as unknown as PoolConnection, calls };
+  return { conn, calls };
 }
 
-function fakePool(appliedNames: string[] = []) {
-  const statements: string[] = [];
+function fakePool(conn: unknown) {
   return {
-    statements,
-    pool: {
-      execute: vi.fn(async (sql: string, params?: unknown[]) => {
-        statements.push(sql.replace(/\s+/g, ' ').trim());
-        if (/FROM schema_migrations/.test(sql)) {
-          return [appliedNames.map((name) => ({ name })), []];
-        }
-        return [{ affectedRows: 0 }, []];
-      }),
-      getConnection: vi.fn(),
-    } as any,
-  };
+    execute: vi.fn(async () => [{ affectedRows: 0 }, []]),
+    getConnection: vi.fn(async () => conn),
+  } as any;
 }
 
 describe('migration list', () => {
@@ -54,76 +56,45 @@ describe('runMigrations', () => {
   beforeEach(() => vi.clearAllMocks());
 
   it('applies only the migrations not already recorded', async () => {
-    const { pool, statements } = fakePool(['001_create_users']);
-    const conn = fakeConn();
-    (pool as any).getConnection = vi.fn(async () => ({
-      ...conn.conn,
-      beginTransaction: vi.fn(),
-      commit: vi.fn(),
-      rollback: vi.fn(),
-      release: vi.fn(),
-    }));
+    const { conn, calls } = fakeConn({ appliedNames: ['001_create_users'] });
+    const pool = fakePool(conn);
 
     await runMigrations(pool);
 
-    const applied = conn.calls.filter((c) => /INSERT INTO schema_migrations/.test(c));
+    const applied = calls.filter((c) => /INSERT INTO schema_migrations/.test(c));
     expect(applied.length).toBe(MIGRATIONS.length - 1);
-    expect(conn.calls.some((c) => /CREATE TABLE IF NOT EXISTS users/.test(c))).toBe(false);
+    expect(calls.some((c) => /CREATE TABLE IF NOT EXISTS users/.test(c))).toBe(false);
   });
 
-  it('records each migration and wraps it in a transaction', async () => {
-    const { pool } = fakePool();
-    const conn = fakeConn();
-    const tx = {
-      ...conn.conn,
-      beginTransaction: vi.fn(),
-      commit: vi.fn(),
-      rollback: vi.fn(),
-      release: vi.fn(),
-    };
-    (pool as any).getConnection = vi.fn(async () => tx);
+  it('takes an advisory lock, records each migration, and releases the connection', async () => {
+    const { conn, calls } = fakeConn();
+    const pool = fakePool(conn);
 
     await runMigrations(pool);
 
-    expect(tx.beginTransaction).toHaveBeenCalledTimes(MIGRATIONS.length);
-    expect(tx.commit).toHaveBeenCalledTimes(MIGRATIONS.length);
-    expect(tx.rollback).not.toHaveBeenCalled();
-    expect(tx.release).toHaveBeenCalledTimes(MIGRATIONS.length);
+    expect(calls.some((c) => /GET_LOCK/.test(c))).toBe(true);
+    expect(calls.some((c) => /RELEASE_LOCK/.test(c))).toBe(true);
+    expect(calls.filter((c) => /INSERT INTO schema_migrations/.test(c)).length).toBe(MIGRATIONS.length);
+    expect(conn.release).toHaveBeenCalledTimes(1);
   });
 
-  it('rolls back and throws when a migration fails', async () => {
-    const { pool } = fakePool();
-    const tx = {
-      execute: vi.fn(async (sql: string) => {
-        if (/CREATE TABLE IF NOT EXISTS tracks/.test(sql)) throw new Error('syntax error');
-        return [{ affectedRows: 0 }, []];
-      }),
-      beginTransaction: vi.fn(),
-      commit: vi.fn(),
-      rollback: vi.fn(),
-      release: vi.fn(),
-    };
-    (pool as any).getConnection = vi.fn(async () => tx);
+  it('stops at the failing migration but releases the lock and connection', async () => {
+    const { conn, calls } = fakeConn({ failOn: /CREATE TABLE IF NOT EXISTS tracks/ });
+    const pool = fakePool(conn);
 
     await expect(runMigrations(pool)).rejects.toThrow(/"004_create_tracks" failed: syntax error/);
-    // Only the failing migration rolls back; the ones before it already
-    // committed and are recorded, so a re-run resumes from there.
-    expect(tx.rollback).toHaveBeenCalledTimes(1);
-    expect(tx.commit).toHaveBeenCalledTimes(3);
+
+    // The three migrations before the failure were still recorded.
+    expect(calls.filter((c) => /INSERT INTO schema_migrations/.test(c)).length).toBe(3);
+    expect(calls.some((c) => /RELEASE_LOCK/.test(c))).toBe(true);
+    expect(conn.release).toHaveBeenCalledTimes(1);
   });
 
-  it('releases the connection even when a migration throws', async () => {
-    const { pool } = fakePool();
-    const tx = {
-      execute: vi.fn(async () => { throw new Error('boom'); }),
-      beginTransaction: vi.fn(),
-      commit: vi.fn(),
-      rollback: vi.fn(async () => {}),
-      release: vi.fn(),
-    };
-    (pool as any).getConnection = vi.fn(async () => tx);
+  it('refuses to run when the advisory lock cannot be acquired', async () => {
+    const { conn } = fakeConn({ acquired: 0 });
+    const pool = fakePool(conn);
 
-    await expect(runMigrations(pool)).rejects.toThrow();
-    expect(tx.release).toHaveBeenCalledTimes(1);
+    await expect(runMigrations(pool)).rejects.toThrow(/migration lock/);
+    expect(conn.release).toHaveBeenCalledTimes(1);
   });
 });

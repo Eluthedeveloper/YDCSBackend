@@ -34,7 +34,6 @@ vi.mock('../cache/redis', async () => {
     cacheGet: cache.get,
     cacheSet: cache.set,
     cacheDelete: cache.del,
-    cacheInvalidate: cache.invalidate,
   };
 });
 
@@ -359,6 +358,22 @@ describe('GET /api/public/search', () => {
       // Every placeholder is bound to the same escaped wildcard, never inlined.
       for (const param of call[1]) {
         expect(param).toBe("%' OR 1=1 --%");
+      }
+    }
+  });
+
+  // An unescaped `%` or `_` in the query would match whole tables, so the
+  // wildcards are escaped the same way chatDatabase.ts escapes them.
+  it('escapes LIKE wildcards in the visitor term', async () => {
+    db.queryAll.mockResolvedValue([]);
+    await request(app).get('/api/public/search?q=100%_of_');
+
+    const calls = db.queryAll.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call[0]).toMatch(/LIKE \? ESCAPE '!' /);
+      for (const param of call[1]) {
+        expect(param).toBe('%100!%!_of!_%');
       }
     }
   });

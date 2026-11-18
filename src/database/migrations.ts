@@ -352,6 +352,38 @@ const CREATE_TABLES: Migration[] = [
       `);
     },
   },
+  {
+    // Optional section label inside a program ("Matthew", "Genesis", …). Tracks
+    // with no label keep group_order 0 so they render first; every named group
+    // gets the next order when its first track is created. Both columns are
+    // nullable/defaulted, so existing rows need no backfill.
+    name: '020_add_tracks_group',
+    up: async (conn) => {
+      try {
+        await conn.execute(
+          'ALTER TABLE tracks ADD COLUMN group_name VARCHAR(120) NULL AFTER track_type'
+        );
+      } catch (e: any) {
+        // 1060 = duplicate column: an earlier run already added it.
+        if (e.errno !== 1060) throw e;
+      }
+      try {
+        await conn.execute(
+          'ALTER TABLE tracks ADD COLUMN group_order INT NOT NULL DEFAULT 0 AFTER group_name'
+        );
+      } catch (e: any) {
+        if (e.errno !== 1060) throw e;
+      }
+      try {
+        await conn.execute(
+          'CREATE INDEX idx_tracks_group ON tracks(program_id, group_order, sort_order)'
+        );
+      } catch (e: any) {
+        // 1061 = duplicate key name, i.e. the index already exists.
+        if (e.errno !== 1061) throw e;
+      }
+    },
+  },
 ];
 
 /**
@@ -440,6 +472,23 @@ const CREATE_INDEXES: Migration[] = [
 
 export const MIGRATIONS: Migration[] = [...CREATE_TABLES, ...CREATE_INDEXES];
 
+const MIGRATION_LOCK = 'ydcs:migrations';
+const MIGRATION_LOCK_TIMEOUT_SECONDS = 30;
+
+/**
+ * Applies every migration that is not yet recorded.
+ *
+ * A MySQL named lock (`GET_LOCK`) serialises concurrent runners. Without it,
+ * two instances starting together (a rolling deploy, a restart overlap, several
+ * replicas) both read an incomplete `schema_migrations` and both apply the same
+ * migration. The lock is per-connection, so the whole run uses one connection.
+ *
+ * No transaction wraps the statements: MySQL DDL (`CREATE`/`ALTER`) implicitly
+ * commits, so a transaction here would promise atomicity it cannot deliver and
+ * a rollback would silently do nothing. Every migration is instead written to
+ * be idempotent (IF NOT EXISTS, INSERT IGNORE, duplicate-column/index handling,
+ * or a guarded UPDATE), so a retry after a mid-migration failure resumes safely.
+ */
 export async function runMigrations(pool: Pool): Promise<void> {
   await pool.execute(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -448,23 +497,39 @@ export async function runMigrations(pool: Pool): Promise<void> {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
 
-  const [rows] = await pool.execute<any[]>('SELECT name FROM schema_migrations');
-  const applied = new Set(rows.map((r) => r.name));
-
-  for (const migration of MIGRATIONS) {
-    if (applied.has(migration.name)) continue;
-    const conn = await pool.getConnection();
-    try {
-      await conn.beginTransaction();
-      await migration.up(conn);
-      await conn.execute('INSERT INTO schema_migrations (name) VALUES (?)', [migration.name]);
-      await conn.commit();
-      console.log(`Migration applied: ${migration.name}`);
-    } catch (err) {
-      await conn.rollback();
-      throw new Error(`Migration "${migration.name}" failed: ${(err as Error).message}`);
-    } finally {
-      conn.release();
+  const conn = await pool.getConnection();
+  let locked = false;
+  try {
+    const [lockRows] = await conn.execute<any[]>(
+      'SELECT GET_LOCK(?, ?) AS acquired',
+      [MIGRATION_LOCK, MIGRATION_LOCK_TIMEOUT_SECONDS]
+    );
+    locked = Number((lockRows as Array<{ acquired: number | null }>)[0]?.acquired) === 1;
+    if (!locked) {
+      throw new Error(`Could not acquire the migration lock within ${MIGRATION_LOCK_TIMEOUT_SECONDS}s`);
     }
+
+    const [rows] = await conn.execute<any[]>('SELECT name FROM schema_migrations');
+    const applied = new Set(rows.map((r) => r.name));
+
+    for (const migration of MIGRATIONS) {
+      if (applied.has(migration.name)) continue;
+      try {
+        await migration.up(conn);
+        await conn.execute('INSERT INTO schema_migrations (name) VALUES (?)', [migration.name]);
+        console.log(`Migration applied: ${migration.name}`);
+      } catch (err) {
+        throw new Error(`Migration "${migration.name}" failed: ${(err as Error).message}`);
+      }
+    }
+  } finally {
+    if (locked) {
+      try {
+        await conn.execute('SELECT RELEASE_LOCK(?)', [MIGRATION_LOCK]);
+      } catch {
+        // Releasing the connection below drops the lock anyway.
+      }
+    }
+    conn.release();
   }
 }

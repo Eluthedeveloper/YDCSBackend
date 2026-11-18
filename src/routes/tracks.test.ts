@@ -56,7 +56,6 @@ vi.mock('../cache/redis', async () => {
     cacheGet: vi.fn().mockResolvedValue(null),
     cacheSet: vi.fn(),
     cacheDelete: vi.fn().mockResolvedValue(undefined),
-    cacheInvalidate: vi.fn().mockResolvedValue(undefined),
   };
 });
 
@@ -155,6 +154,9 @@ beforeEach(() => {
     fn({
       execute: async (sql: string, params?: unknown[]) => {
         if (/MAX\(sort_order\)/.test(sql)) return [[{ next: 7 }], []];
+        // Group resolution: no existing section, so the first one is order 1.
+        if (/SELECT group_order FROM tracks/.test(sql)) return [[], []];
+        if (/MAX\(group_order\)/.test(sql)) return [[{ next: 1 }], []];
         await db.runSQL(sql, params);
         return [{ affectedRows: 1 }, []];
       },
@@ -238,6 +240,53 @@ describe('POST /api/tracks orphaned uploads', () => {
 
     expect(res.status).toBe(400);
     expect(unlink).toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/tracks group', () => {
+  it('stores the section label and its order', async () => {
+    const res = await upload({ title: 'Song', program_id: 'p1', group_name: 'Matthew' });
+
+    expect(res.status).toBe(201);
+    const insert = db.runSQL.mock.calls.find((c) => /INSERT INTO tracks/.test(c[0] as string));
+    expect(insert?.[1]).toContain('Matthew');
+    expect(insert?.[1]).toContain(1);
+    expect(res.body).toMatchObject({ group_name: 'Matthew', group_order: 1 });
+  });
+
+  it('rejects a group label past the column width', async () => {
+    const res = await upload({ title: 'Song', program_id: 'p1', group_name: 'x'.repeat(121) });
+
+    expect(res.status).toBe(400);
+    expect(unlink).toHaveBeenCalled();
+    expect(db.runSQL).not.toHaveBeenCalled();
+  });
+});
+
+describe('PUT /api/tracks/groups/assign', () => {
+  it('assigns one label to a whole selection in a single request', async () => {
+    db.queryAll.mockResolvedValue([{ program_id: 'p1' }]);
+
+    const res = await request(app)
+      .put('/api/tracks/groups/assign')
+      .set('Cookie', adminCookie())
+      .send({ trackIds: ['t1', 't2'], group_name: 'Genesis' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ updated: 1 });
+    expect(db.runSQL).toHaveBeenCalledWith(
+      expect.stringContaining('UPDATE tracks SET group_name'),
+      ['Genesis', 1, 't1', 't2', 'p1']
+    );
+  });
+
+  it('rejects an empty selection', async () => {
+    const res = await request(app)
+      .put('/api/tracks/groups/assign')
+      .set('Cookie', adminCookie())
+      .send({ trackIds: [] });
+
+    expect(res.status).toBe(400);
   });
 });
 
@@ -487,5 +536,87 @@ describe('DELETE /api/tracks', () => {
     expect(res.body).toEqual({ message: 'Tracks deleted', deleted: 0, notFound: ['ghost'] });
     expect(db.runSQL).not.toHaveBeenCalled();
     expect(unlink).not.toHaveBeenCalled();
+  });
+});
+describe('PUT /api/tracks/groups/reorder/:programId', () => {
+  function reorder(groups: unknown) {
+    return request(app)
+      .put('/api/tracks/groups/reorder/p1')
+      .set('Cookie', adminCookie())
+      .send({ groups });
+  }
+
+  // Simulates the route's read of the program's existing sections.
+  function mockExistingGroups(names: string[]) {
+    db.withTransaction.mockImplementation(async (fn: (conn: unknown) => unknown) =>
+      fn({
+        execute: async (sql: string, params?: unknown[]) => {
+          if (/GROUP BY group_name/.test(sql)) {
+            return [names.map((name) => ({ group_name: name, group_order: 1 })), []];
+          }
+          await db.runSQL(sql, params);
+          return [{ affectedRows: 1 }, []];
+        },
+      })
+    );
+  }
+
+  const groupUpdates = () =>
+    db.runSQL.mock.calls.filter((c) => /UPDATE tracks SET group_order/.test(c[0] as string));
+
+  it('assigns sequential group_order in the order given', async () => {
+    mockExistingGroups(['Matthew', 'Genesis', 'Exodus']);
+
+    const res = await reorder(['Matthew', 'Genesis', 'Exodus']);
+
+    expect(res.status).toBe(200);
+    expect(groupUpdates().map((c) => c[1])).toEqual([
+      [1, 'p1', 'Matthew'],
+      [2, 'p1', 'Genesis'],
+      [3, 'p1', 'Exodus'],
+    ]);
+  });
+
+  it('appends a group the caller left out instead of leaving a colliding order', async () => {
+    mockExistingGroups(['Matthew', 'Genesis', 'Exodus']);
+
+    const res = await reorder(['Exodus', 'Matthew']);
+
+    expect(res.status).toBe(200);
+    expect(groupUpdates().map((c) => c[1])).toEqual([
+      [1, 'p1', 'Exodus'],
+      [2, 'p1', 'Matthew'],
+      [3, 'p1', 'Genesis'],
+    ]);
+    expect(res.body.groups).toEqual(['Exodus', 'Matthew', 'Genesis']);
+  });
+
+  it('rejects a label the program does not have', async () => {
+    mockExistingGroups(['Matthew']);
+
+    const res = await reorder(['Genesis']);
+
+    expect(res.status).toBe(400);
+    expect(groupUpdates()).toHaveLength(0);
+  });
+
+  it('rejects a body that is not an array', async () => {
+    const res = await reorder('Matthew');
+
+    expect(res.status).toBe(400);
+    expect(db.runSQL).not.toHaveBeenCalled();
+  });
+
+  it('rejects blank labels and duplicates', async () => {
+    expect((await reorder(['Matthew', '   '])).status).toBe(400);
+    expect((await reorder(['Matthew', 'Matthew'])).status).toBe(400);
+    expect(db.runSQL).not.toHaveBeenCalled();
+  });
+
+  it('caps the number of groups so one request cannot hold the pool', async () => {
+    const res = await reorder(Array.from({ length: 201 }, (_, i) => `group-${i}`));
+
+    expect(res.status).toBe(400);
+    expect(db.runSQL).not.toHaveBeenCalled();
   });
 });

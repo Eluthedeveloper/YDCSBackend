@@ -13,6 +13,12 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
 const BCRYPT_ROUNDS = 12;
 
+// A real bcrypt hash of an unguessable value. When the username does not exist
+// the login handler still compares against this, so a missing account costs the
+// same as a wrong password and response timing cannot be used to enumerate
+// valid usernames. The plaintext is irrelevant; it is never a valid password.
+const DUMMY_PASSWORD_HASH = '$2a$12$cZI5pKaiv5QBE.kSpUOV3.Da.5NdtI/QGAUf9X.O.pxF9cpzI/xUa';
+
 interface UserRow {
   id: string;
   username: string;
@@ -66,7 +72,10 @@ router.post('/login', asyncHandler(async (req, res: Response) => {
 
   const user = await queryOne<SeededUserRow>('SELECT * FROM users WHERE username = ?', [username]);
 
-  if (!user || !await bcrypt.compare(password, user.password)) {
+  // Always run bcrypt, even for an unknown username, so the response time does
+  // not reveal whether the account exists.
+  const passwordMatches = await bcrypt.compare(password, user?.password ?? DUMMY_PASSWORD_HASH);
+  if (!user || !passwordMatches) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
 

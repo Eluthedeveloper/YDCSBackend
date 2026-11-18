@@ -4,7 +4,6 @@ import helmet from 'helmet';
 import multer from 'multer';
 import dotenv from 'dotenv';
 import path from 'path';
-import os from 'os';
 import fsSync from 'fs';
 
 import { initDB, closePool } from './database/schema';
@@ -166,17 +165,17 @@ export function createApp() {
   // CORS. The session cookie is SameSite=Lax, so a cross-site POST never
   // carries it; the exact-origin allowlist below stops any other origin from
   // reading credentialed responses.
+  //
+  // CORS_ORIGINS lets a deployment trim the list. The Docker compose file sets
+  // it without localhost, which only a `npm run dev` session needs.
+  const corsOrigins = (process.env.CORS_ORIGINS ??
+    'https://yemisrachdimts.org,https://www.yemisrachdimts.org,https://listen.yemisrachdimts.org,http://localhost:5173')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
   app.use(
     cors({
-      origin: [
-        'https://yemisrachdimts.org',
-        'https://www.yemisrachdimts.org',
-        // The streaming app's subdomain. Normally same-origin through the
-        // frontend nginx /api/ proxy, allowlisted for builds that point the
-        // client straight at this API instead.
-        'https://listen.yemisrachdimts.org',
-        'http://localhost:5173',
-      ],
+      origin: corsOrigins,
       methods: ['GET', 'POST', 'PUT', 'DELETE'],
       // x-client-fingerprint carries the anonymous listener id used for like and
       // listen dedup; without it the browser preflight rejects those calls.
@@ -205,27 +204,6 @@ export function createApp() {
   });
 
   console.log('Uploads directory:', UPLOADS_ROOT);
-
-  // TEMP DIAGNOSTIC (IDM capture investigation) — remove once resolved.
-  // Logs every uploads request to a file so we can see the exact URL the
-  // browser asks for and whether IDM fetches it again under its own UA.
-  const REQUEST_LOG =
-    process.env.REQUEST_LOG ||
-    (process.env.NODE_ENV === 'production' ? undefined : path.join(os.tmpdir(), 'audiostreaming-uploads.log'));
-  if (REQUEST_LOG) {
-    app.use('/api/uploads', (req, res, next) => {
-      const line = [
-        new Date().toISOString(),
-        req.method,
-        req.originalUrl,
-        `ua=${req.headers['user-agent'] || '-'}`,
-        `range=${req.headers.range || '-'}`,
-        `origin=${req.headers.origin || '-'}`,
-      ].join(' ');
-      fsSync.appendFile(REQUEST_LOG, line + '\n', () => {});
-      next();
-    });
-  }
 
   app.get('/api/uploads/:type/:filename', (req, res) => {
     const { type, filename } = req.params;

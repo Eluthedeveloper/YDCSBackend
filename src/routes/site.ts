@@ -468,7 +468,7 @@ router.get('/schedule', browseLimiter, asyncHandler(async (_req, res: Response) 
 
 // Upsert-by-slot: the grid is addressed by (day, hour), so an admin editing a
 // slot sends the pair, not an id. One statement covers create and move-in-place.
-router.put('/schedule', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.put('/schedule', authenticate, requireAdmin, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const { day, hour, title, host, category } = req.body ?? {};
 
   if (!RADIO_DAY_ORDER.includes(day)) {
@@ -504,7 +504,7 @@ router.put('/schedule', writeLimiter, authenticate, requireAdmin, asyncHandler(a
 }));
 
 // Clearing a slot takes requireSuperAdmin, matching deletes elsewhere here.
-router.delete('/schedule/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
+router.delete('/schedule/:id', authenticate, requireSuperAdmin, writeLimiter, asyncHandler(async (req, res: Response) => {
   const slot = await queryOne<{ id: string }>('SELECT id FROM radio_schedule WHERE id = ?', [req.params.id]);
   if (!slot) return res.status(404).json({ error: 'Slot not found' });
 
@@ -593,7 +593,7 @@ function validateShortwaveFields(body: Record<string, unknown>) {
   };
 }
 
-router.post('/shortwave', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.post('/shortwave', authenticate, requireAdmin, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const result = validateShortwaveFields(req.body ?? {});
   if ('error' in result) return res.status(400).json({ error: result.error });
 
@@ -607,7 +607,7 @@ router.post('/shortwave', writeLimiter, authenticate, requireAdmin, asyncHandler
   res.status(201).json({ id, ...f });
 }));
 
-router.put('/shortwave/:id', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.put('/shortwave/:id', authenticate, requireAdmin, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const existing = await queryOne<ShortwaveRow>('SELECT * FROM shortwave_schedule WHERE id = ?', [req.params.id]);
   if (!existing) return res.status(404).json({ error: 'Entry not found' });
 
@@ -623,7 +623,7 @@ router.put('/shortwave/:id', writeLimiter, authenticate, requireAdmin, asyncHand
   res.json({ message: 'Entry updated' });
 }));
 
-router.delete('/shortwave/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
+router.delete('/shortwave/:id', authenticate, requireSuperAdmin, writeLimiter, asyncHandler(async (req, res: Response) => {
   const existing = await queryOne<{ id: string }>('SELECT id FROM shortwave_schedule WHERE id = ?', [req.params.id]);
   if (!existing) return res.status(404).json({ error: 'Entry not found' });
 
@@ -732,7 +732,7 @@ router.get('/whats-new', browseLimiter, asyncHandler(async (_req, res: Response)
  * ------------------------------------------------------------------ */
 
 // Registered before PUT /leaders/:id so "reorder" is never parsed as an id.
-router.put('/leaders/reorder', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req, res: Response) => {
+router.put('/leaders/reorder', authenticate, requireAdmin, writeLimiter, asyncHandler(async (req, res: Response) => {
   const { ids } = req.body ?? {};
   if (!Array.isArray(ids) || ids.length === 0) {
     return res.status(400).json({ error: 'ids array required' });
@@ -863,7 +863,7 @@ router.put('/leaders/:id', authenticate, requireAdmin, uploadLimiter, leaderUplo
   res.json({ message: 'Leader updated' });
 }));
 
-router.delete('/leaders/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
+router.delete('/leaders/:id', authenticate, requireSuperAdmin, writeLimiter, asyncHandler(async (req, res: Response) => {
   const leader = await queryOne<LeaderRow>('SELECT * FROM leaders WHERE id = ?', [req.params.id]);
   if (!leader) return res.status(404).json({ error: 'Leader not found' });
 
@@ -878,7 +878,7 @@ router.delete('/leaders/:id', writeLimiter, authenticate, requireSuperAdmin, asy
  * Albums
  * ------------------------------------------------------------------ */
 
-router.post('/albums', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.post('/albums', authenticate, requireAdmin, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const { title, description, department } = req.body ?? {};
 
   const cleanTitle = singleString(title);
@@ -906,7 +906,7 @@ router.post('/albums', writeLimiter, authenticate, requireAdmin, asyncHandler(as
   res.status(201).json({ id, title: cleanTitle, description: cleanDescription || null, department: storedDepartment, photos: [] });
 }));
 
-router.put('/albums/:id', writeLimiter, authenticate, requireAdmin, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.put('/albums/:id', authenticate, requireAdmin, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const album = await queryOne<AlbumRow>('SELECT * FROM albums WHERE id = ?', [req.params.id]);
   if (!album) return res.status(404).json({ error: 'Album not found' });
 
@@ -940,7 +940,7 @@ router.put('/albums/:id', writeLimiter, authenticate, requireAdmin, asyncHandler
   res.json({ message: 'Album updated' });
 }));
 
-router.delete('/albums/:id', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
+router.delete('/albums/:id', authenticate, requireSuperAdmin, writeLimiter, asyncHandler(async (req, res: Response) => {
   const album = await queryOne<AlbumRow>('SELECT * FROM albums WHERE id = ?', [req.params.id]);
   if (!album) return res.status(404).json({ error: 'Album not found' });
 
@@ -1011,7 +1011,7 @@ router.post('/albums/:id/photos', authenticate, requireAdmin, uploadLimiter, alb
   res.status(201).json({ uploaded: files.length });
 }));
 
-router.delete('/albums/:albumId/photos/:photoId', writeLimiter, authenticate, requireSuperAdmin, asyncHandler(async (req, res: Response) => {
+router.delete('/albums/:albumId/photos/:photoId', authenticate, requireSuperAdmin, writeLimiter, asyncHandler(async (req, res: Response) => {
   const photo = await queryOne<AlbumPhotoRow>(
     'SELECT * FROM album_photos WHERE id = ? AND album_id = ?',
     [req.params.photoId, req.params.albumId]
@@ -1029,7 +1029,7 @@ router.delete('/albums/:albumId/photos/:photoId', writeLimiter, authenticate, re
  * Announcements
  * ------------------------------------------------------------------ */
 
-router.post('/announcements', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.post('/announcements', authenticate, requireContentEditor, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const { title, body, pinned } = req.body ?? {};
 
   const cleanTitle = singleString(title);
@@ -1051,7 +1051,7 @@ router.post('/announcements', writeLimiter, authenticate, requireContentEditor, 
   res.status(201).json({ id, title: cleanTitle, body: cleanBody || null, pinned: isPinned });
 }));
 
-router.put('/announcements/:id', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.put('/announcements/:id', authenticate, requireContentEditor, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const announcement = await queryOne<AnnouncementRow>('SELECT * FROM announcements WHERE id = ?', [req.params.id]);
   if (!announcement) return res.status(404).json({ error: 'Announcement not found' });
 
@@ -1080,7 +1080,7 @@ router.put('/announcements/:id', writeLimiter, authenticate, requireContentEdito
   res.json({ message: 'Announcement updated' });
 }));
 
-router.delete('/announcements/:id', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.delete('/announcements/:id', authenticate, requireContentEditor, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const announcement = await queryOne<AnnouncementRow>('SELECT * FROM announcements WHERE id = ?', [req.params.id]);
   if (!announcement) return res.status(404).json({ error: 'Announcement not found' });
   if (!canDeleteContent(req, announcement.created_by)) {
@@ -1096,7 +1096,7 @@ router.delete('/announcements/:id', writeLimiter, authenticate, requireContentEd
  * Events
  * ------------------------------------------------------------------ */
 
-router.post('/events', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.post('/events', authenticate, requireContentEditor, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const { title, description, location, starts_at, ends_at } = req.body ?? {};
 
   const cleanTitle = singleString(title);
@@ -1136,7 +1136,7 @@ router.post('/events', writeLimiter, authenticate, requireContentEditor, asyncHa
   });
 }));
 
-router.put('/events/:id', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.put('/events/:id', authenticate, requireContentEditor, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const event = await queryOne<EventRow>('SELECT * FROM events WHERE id = ?', [req.params.id]);
   if (!event) return res.status(404).json({ error: 'Event not found' });
 
@@ -1187,7 +1187,7 @@ router.put('/events/:id', writeLimiter, authenticate, requireContentEditor, asyn
   res.json({ message: 'Event updated' });
 }));
 
-router.delete('/events/:id', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.delete('/events/:id', authenticate, requireContentEditor, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const event = await queryOne<EventRow>('SELECT * FROM events WHERE id = ?', [req.params.id]);
   if (!event) return res.status(404).json({ error: 'Event not found' });
   if (!canDeleteContent(req, event.created_by)) {
@@ -1209,7 +1209,7 @@ function blogUploadFields(req: AuthRequest): { cover?: Express.Multer.File; gall
   return { cover: files.cover?.[0], gallery: files.images ?? [] };
 }
 
-router.post('/blog', writeLimiter, authenticate, requireContentEditor, uploadLimiter, blogUpload.fields([
+router.post('/blog', authenticate, requireContentEditor, writeLimiter, uploadLimiter, blogUpload.fields([
   { name: 'cover', maxCount: 1 },
   { name: 'images', maxCount: MAX_BLOG_IMAGES },
 ]), asyncHandler(async (req: AuthRequest, res: Response) => {
@@ -1274,7 +1274,7 @@ router.post('/blog', writeLimiter, authenticate, requireContentEditor, uploadLim
   });
 }));
 
-router.put('/blog/:id', writeLimiter, authenticate, requireContentEditor, uploadLimiter, blogUpload.fields([
+router.put('/blog/:id', authenticate, requireContentEditor, writeLimiter, uploadLimiter, blogUpload.fields([
   { name: 'cover', maxCount: 1 },
   { name: 'images', maxCount: MAX_BLOG_IMAGES },
 ]), asyncHandler(async (req: AuthRequest, res: Response) => {
@@ -1348,7 +1348,7 @@ router.put('/blog/:id', writeLimiter, authenticate, requireContentEditor, upload
   res.json({ message: 'Post updated' });
 }));
 
-router.delete('/blog/:id', writeLimiter, authenticate, requireContentEditor, asyncHandler(async (req: AuthRequest, res: Response) => {
+router.delete('/blog/:id', authenticate, requireContentEditor, writeLimiter, asyncHandler(async (req: AuthRequest, res: Response) => {
   const post = await queryOne<BlogRow>('SELECT * FROM blog_posts WHERE id = ?', [req.params.id]);
   if (!post) return res.status(404).json({ error: 'Post not found' });
   if (!canDeleteContent(req, post.created_by)) {

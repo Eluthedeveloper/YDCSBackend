@@ -15,7 +15,6 @@ export type SqlParam = string | number | boolean | Date | Buffer | null;
  * whatever columns their SELECT listed. Anything narrower should pass a type
  * argument (`queryOne<{ count: number }>(...)`) rather than casting the result.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type Row = Record<string, any>;
 
 export async function initDB(): Promise<mysql.Pool> {

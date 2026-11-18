@@ -35,7 +35,6 @@ vi.mock('../cache/redis', async () => {
     cacheGet: vi.fn().mockResolvedValue(null),
     cacheSet: vi.fn(),
     cacheDelete: vi.fn().mockResolvedValue(undefined),
-    cacheInvalidate: vi.fn().mockResolvedValue(undefined),
   };
 });
 

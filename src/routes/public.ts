@@ -94,7 +94,7 @@ router.get('/programs/:id', asyncHandler(async (req, res: Response) => {
       FROM tracks t
       JOIN programs p ON t.program_id = p.id
       WHERE t.program_id = ?
-      ORDER BY t.sort_order ASC, t.created_at ASC
+      ORDER BY t.group_order ASC, t.sort_order ASC, t.created_at ASC
     `, [req.params.id]),
     queryAll(`
       SELECT id, guest_name, content, created_at FROM comments
@@ -138,7 +138,11 @@ router.get('/search', asyncHandler(async (req, res: Response) => {
     return res.json({ programs: [], tracks: [] });
   }
 
-  const like = `%${q}%`;
+  // The three LIKE metacharacters are escaped so a visitor's `%` or `_` cannot
+  // widen the query into a whole-table match. `!` is the escape character,
+  // matching chatDatabase.ts, so the behaviour never depends on MySQL's
+  // NO_BACKSLASH_ESCAPES mode.
+  const like = `%${q.replace(/[!%_]/g, '!$&')}%`;
 
   const [programs, tracks] = await Promise.all([
     queryAll(`
@@ -147,7 +151,7 @@ router.get('/search', asyncHandler(async (req, res: Response) => {
         (SELECT COUNT(*) FROM comments WHERE program_id = p.id) as comment_count
       FROM programs p
       JOIN users u ON p.created_by = u.id
-      WHERE p.title LIKE ? OR p.description LIKE ?
+      WHERE p.title LIKE ? ESCAPE '!' OR p.description LIKE ? ESCAPE '!'
       ORDER BY p.created_at DESC
       LIMIT 20
     `, [like, like]),
@@ -157,7 +161,7 @@ router.get('/search', asyncHandler(async (req, res: Response) => {
         p.title as program_title, p.cover_image as program_cover
       FROM tracks t
       JOIN programs p ON t.program_id = p.id
-      WHERE t.title LIKE ? OR t.artist LIKE ? OR t.album LIKE ?
+      WHERE t.title LIKE ? ESCAPE '!' OR t.artist LIKE ? ESCAPE '!' OR t.album LIKE ? ESCAPE '!'
       ORDER BY t.created_at DESC
       LIMIT 50
     `, [like, like, like]),

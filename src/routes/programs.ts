@@ -128,7 +128,7 @@ router.get('/:id', authenticate, requireAdmin, asyncHandler(async (req, res: Res
 
   const { limit, offset } = pagination(req.query as Record<string, unknown>);
   const tracks = await queryAll(
-    'SELECT * FROM tracks WHERE program_id = ? ORDER BY sort_order ASC, created_at ASC LIMIT ? OFFSET ?',
+    'SELECT * FROM tracks WHERE program_id = ? ORDER BY group_order ASC, sort_order ASC, created_at ASC LIMIT ? OFFSET ?',
     [req.params.id, limit, offset]
   );
 

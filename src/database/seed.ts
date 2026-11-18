@@ -1,5 +1,5 @@
 import { randomInt } from 'crypto';
-import { initDB, queryOne, runSQL, closePool } from './schema';
+import { initDB, queryOne, withTransaction, closePool } from './schema';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -44,18 +44,23 @@ async function seed() {
     { username: 'editor', email: 'editor@audio.com', role: 'editor' },
   ].map((a) => ({ ...a, password: generatePassword() }));
 
-  for (const account of accounts) {
-    await runSQL(
-      'INSERT INTO users (id, username, email, password, role) VALUES (?, ?, ?, ?, ?)',
-      [
-        uuidv4(),
-        account.username,
-        account.email,
-        bcrypt.hashSync(account.password, 12),
-        account.role,
-      ]
-    );
-  }
+  // All three accounts are created together: a failure on the second insert
+  // (for example a duplicate email) must not leave a partially seeded install
+  // that looks "already seeded" to the next run.
+  await withTransaction(async (conn) => {
+    for (const account of accounts) {
+      await conn.execute(
+        'INSERT INTO users (id, username, email, password, role) VALUES (?, ?, ?, ?, ?)',
+        [
+          uuidv4(),
+          account.username,
+          account.email,
+          bcrypt.hashSync(account.password, 12),
+          account.role,
+        ]
+      );
+    }
+  });
 
   console.log('\n============================================================');
   console.log(' Seeded accounts — these passwords are shown ONCE. Store them now.');

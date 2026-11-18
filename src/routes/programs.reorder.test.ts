@@ -35,7 +35,6 @@ vi.mock('../cache/redis', async () => {
     cacheGet: cache.get,
     cacheSet: cache.set,
     cacheDelete: cache.del,
-    cacheInvalidate: cache.invalidate,
   };
 });
 

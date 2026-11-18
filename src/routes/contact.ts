@@ -67,6 +67,13 @@ function escapeHtml(str: string): string {
     .replace(/'/g, '&#39;');
 }
 
+// Header values must never carry CR/LF: a newline is how a crafted subject
+// tries to append extra headers (Bcc, etc.). Nodemailer folds these, but
+// stripping them here keeps the intent explicit at the point they are built.
+function headerSafe(value: string): string {
+  return value.replace(/[\r\n]+/g, ' ').trim();
+}
+
 // Shared modern email shell — gradient header, card body, clean footer
 function emailShell(opts: {
   headerTitle: string;
@@ -118,6 +125,15 @@ function infoRow(label: string, value: string): string {
 
 router.post('/', contactLimiter, asyncHandler(async (req, res: Response) => {
   const asString = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+
+  // Honeypot. The real form hides this field with CSS, so only a bot that
+  // fills every input will ever send it. Answering with the same success body
+  // (and sending nothing) keeps the spammer from learning the trap and burns
+  // their time against an invisible sink instead of the ministry's inbox.
+  if (asString(req.body?.website)) {
+    return res.json({ success: true, message: 'Your message has been sent. We will contact you soon.' });
+  }
+
   const name = asString(req.body?.name);
   const email = asString(req.body?.email);
   const phone = asString(req.body?.phone);
@@ -180,8 +196,8 @@ router.post('/', contactLimiter, asyncHandler(async (req, res: Response) => {
     await transporter.sendMail({
       from: `"${process.env.SMTP_FROM_NAME || 'YDCS Radio'}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
       to: process.env.CONTACT_RECEIVER || process.env.SMTP_USER,
-      replyTo: email,
-      subject: `[Contact Form] ${subject}`,
+      replyTo: headerSafe(email),
+      subject: `[Contact Form] ${headerSafe(subject)}`,
       html: emailShell({
         headerTitle: 'New Contact Form Message',
         headerSubtitle: 'Someone reached out through the YDCS Radio website',

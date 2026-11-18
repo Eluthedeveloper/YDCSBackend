@@ -79,29 +79,6 @@ export async function cacheDelete(...keys: string[]): Promise<void> {
   } catch {}
 }
 
-export async function cacheInvalidate(pattern: string): Promise<void> {
-  if (!redis) return;
-  try {
-    let cursor = '0';
-    const keysToDelete: string[] = [];
-    do {
-      const [nextCursor, keys] = await redis.scan(
-        cursor,
-        'MATCH',
-        pattern,
-        'COUNT',
-        100
-      );
-      cursor = nextCursor;
-      keysToDelete.push(...keys);
-    } while (cursor !== '0');
-
-    if (keysToDelete.length > 0) {
-      await redis.del(...keysToDelete);
-    }
-  } catch {}
-}
-
 /**
  * Closes both connections. Called on shutdown and in tests; without it the
  * rate-limit duplicate keeps the event loop alive after the server is done.

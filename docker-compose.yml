@@ -8,7 +8,7 @@ services:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-audiostreaming}
       MYSQL_USER: ${MYSQL_USER:-audio}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-audio}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     # Bound to loopback on a non-default host port so a backend started outside
     # Docker (`npm run dev`) can reach the same database. Another MySQL already
@@ -18,7 +18,10 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      # MYSQL_PWD is expanded by the shell at run time, so the root password
+      # never appears in the container's process list the way a `-p...`
+      # argument would.
+      test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysqladmin ping -h 127.0.0.1 -u root"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -27,11 +30,20 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    # requirepass is empty unless REDIS_PASSWORD is set in .env, in which case
+    # both this server and the backend client (REDIS_PASSWORD below) enforce
+    # AUTH. Redis is not port-mapped, so the docker network is the only wall
+    # today; setting REDIS_PASSWORD adds a second one.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-}"]
+    environment:
+      # Exposed to the healthcheck below so it can AUTH when a password is set.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # `redis-cli ping` returns NOAUTH when --requirepass is active, which would
+      # mark the container unhealthy and block the backend's depends_on gate.
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping; else redis-cli ping; fi"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -47,7 +59,7 @@ services:
       DB_HOST: mysql
       DB_PORT: "3306"
       DB_USER: ${MYSQL_USER:-audio}
-      DB_PASSWORD: ${MYSQL_PASSWORD:-audio}
+      DB_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
       DB_NAME: ${MYSQL_DATABASE:-audiostreaming}
       # Bytes per audio upload chunk. Empty keeps the server default (512 KB),
       # which fits under nginx's stock 1 MB body cap. Raise it only when the
@@ -60,7 +72,13 @@ services:
       REDIS_ENABLED: "${REDIS_ENABLED:-true}"
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      REDIS_PASSWORD: ""
+      # Empty keeps auth off; a value is honoured by both redis (--requirepass
+      # above) and the backend client, so the pair stays consistent.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      # Exact-origin allowlist for credentialed responses. localhost:5173 is a
+      # dev-only origin (`npm run dev` against the Docker database), so the
+      # production container omits it.
+      CORS_ORIGINS: "https://yemisrachdimts.org,https://www.yemisrachdimts.org,https://listen.yemisrachdimts.org"
       SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
       SMTP_PORT: "${SMTP_PORT:-587}"
       SMTP_SECURE: "${SMTP_SECURE:-false}"
