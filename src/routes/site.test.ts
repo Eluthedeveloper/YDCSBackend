@@ -648,6 +648,8 @@ describe('GET /api/site/whats-new', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.map((item: { id: string }) => item.id)).toEqual(['e1', 'a1', 'b1']);
+    expect(res.body[0].url).toBe('/#events');
+    expect(res.body[1].url).toBe('/#announcements');
     expect(res.body[2].url).toBe('/blog/post-one');
     expect(res.body[2].type).toBe('blog');
     // One minute, not the five the lists use: a new announcement should not

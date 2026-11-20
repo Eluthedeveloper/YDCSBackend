@@ -6,8 +6,8 @@ import dotenv from 'dotenv';
 import path from 'path';
 import fsSync from 'fs';
 
-import { initDB, closePool } from './database/schema';
-import { closeRedis } from './cache/redis';
+import { initDB, closePool, queryOne } from './database/schema';
+import redis, { closeRedis } from './cache/redis';
 
 import authRoutes from './routes/auth';
 import programRoutes from './routes/programs';
@@ -16,9 +16,12 @@ import publicRoutes from './routes/public';
 import analyticsRoutes from './routes/analytics';
 import contactRoutes from './routes/contact';
 import siteRoutes from './routes/site';
-import chatRoutes from './routes/chat';
+import chatbotRoutes from './routes/chatbot';
+import adminChatbotRoutes from './routes/adminChatbot';
+import { invalidateChatbotCache } from './lib/chatbot';
+import { mapWritePathToSource, scheduleContentSync, startChatbotSyncScheduler, syncAllContent } from './lib/chatbotSync';
 
-import { generalLimiter, browseLimiter, authLimiter } from './middleware/rateLimit';
+import { generalLimiter, browseLimiter, authLimiter, mediaLimiter } from './middleware/rateLimit';
 
 dotenv.config();
 
@@ -74,39 +77,63 @@ function streamContentTypeIsNeutral(): boolean {
   return (process.env.STREAM_CONTENT_TYPE || 'audio').toLowerCase() === 'neutral';
 }
 
+// Directory listings are cached briefly. The old resolver called readdirSync on
+// every `.stream` request (a `.stream` URL never exists on disk, so the fast
+// path always missed), which blocked the event loop and scanned the whole
+// catalogue on every play and every seek. Async + a 1s cache keeps new uploads
+// playable almost immediately while making a miss O(1).
+const AUDIO_INDEX_TTL_MS = 1000;
+const audioIndex = new Map<string, { entries: string[]; at: number; mtimeMs: number }>();
+
+async function listAudioEntries(typeRoot: string): Promise<string[]> {
+  const now = Date.now();
+  const cached = audioIndex.get(typeRoot);
+  const dir = await fsSync.promises.stat(typeRoot).catch(() => null);
+
+  // A new upload changes the directory's mtime, so the listing is refreshed
+  // immediately rather than waiting out the TTL (and stale entries from a
+  // deleted file stop being served).
+  if (cached && dir && cached.mtimeMs === dir.mtimeMs && now - cached.at < AUDIO_INDEX_TTL_MS) {
+    return cached.entries;
+  }
+
+  try {
+    const entries = await fsSync.promises.readdir(typeRoot);
+    audioIndex.set(typeRoot, { entries, at: now, mtimeMs: dir?.mtimeMs ?? 0 });
+    return entries;
+  } catch {
+    return cached?.entries ?? [];
+  }
+}
+
 /**
  * Maps a request filename to a real file in `typeRoot`, or null if there is
- * none.
- *
- * `filename` must already be basename()-collapsed by the caller.
- *
- * The exact name is tried first so cover images, and any future upload whose
- * extension is literally `.stream`, keep working unchanged. Only then is the
- * `.stream` suffix stripped and the stem matched against the real directory
- * listing. Matching entries rather than building candidate paths means a
- * traversal attempt cannot escape: nothing that is not already a name in that
- * one directory can ever match.
+ * none. Never blocks the event loop and never scans the directory more than
+ * once per second per type.
  */
-function resolveUploadFile(typeRoot: string, filename: string): string | null {
+async function resolveUploadFile(typeRoot: string, filename: string): Promise<string | null> {
   const direct = path.join(typeRoot, filename);
-  if (fsSync.existsSync(direct)) return direct;
+  try {
+    await fsSync.promises.access(direct);
+    return direct;
+  } catch {
+    // Not a literal file; fall through to `.stream` resolution.
+  }
 
   if (!filename.toLowerCase().endsWith(STREAM_SUFFIX)) return null;
 
-  let entries: string[];
-  try {
-    entries = fsSync.readdirSync(typeRoot);
-  } catch {
-    return null;
-  }
+  const stem = filename.slice(0, -STREAM_SUFFIX.length);
+  if (!/^[A-Za-z0-9._-]+$/.test(stem)) return null;
+
+  const entries = await listAudioEntries(typeRoot);
 
   // Compared case-insensitively because tracks.ts stores the upload's original
   // extension verbatim (`path.extname(file.originalname)`), so an uploaded
   // `SONG.MP3` lands on disk with an uppercase extension.
-  const wanted = AUDIO_EXTENSIONS.map((ext) => (filename.slice(0, -STREAM_SUFFIX.length) + ext).toLowerCase());
+  const wanted = AUDIO_EXTENSIONS.map((ext) => (stem + ext).toLowerCase());
 
-  // Joined back onto typeRoot: readdirSync yields bare entry names, and the
-  // caller needs a path it can stat and stream.
+  // Joined back onto typeRoot: readdir yields bare entry names, and the caller
+  // needs a path it can stat and stream.
   const match = entries.find((entry) => wanted.includes(entry.toLowerCase()));
   return match ? path.join(typeRoot, match) : null;
 }
@@ -184,14 +211,12 @@ export function createApp() {
     })
   );
 
-  // One general limiter for the whole API, except GET media under /api/uploads.
-  // Audio playback issues a burst of Range requests per seek; counting those
-  // against the shared window is what made production play/pause fail with
-  // 429s (media element error → isPlaying desync → pause called resume)
-  // while localhost never tripped. Writes still go through per-router limiters.
+  // Media reads get their own limiter instead of a blanket exemption. Audio
+  // playback issues a burst of Range requests per seek, so it cannot share the
+  // page limit — but unbounded access made the uploads route a free DoS surface.
   app.use('/api/', (req, res, next) => {
     if (req.method === 'GET' && req.originalUrl.startsWith('/api/uploads/')) {
-      return next();
+      return mediaLimiter(req, res, next);
     }
     // Chunk uploads are exempt too: they are counted by chunkLimiter, which
     // is sized for the number of chunks a file needs. Counting them here as
@@ -205,7 +230,7 @@ export function createApp() {
 
   console.log('Uploads directory:', UPLOADS_ROOT);
 
-  app.get('/api/uploads/:type/:filename', (req, res) => {
+  app.get('/api/uploads/:type/:filename', async (req, res) => {
     const { type, filename } = req.params;
     if (!(UPLOAD_TYPES as readonly string[]).includes(type)) {
       return res.status(404).json({ error: 'Invalid type' });
@@ -222,7 +247,7 @@ export function createApp() {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const resolved = resolveUploadFile(typeRoot, safeFilename);
+    const resolved = await resolveUploadFile(typeRoot, safeFilename);
     if (!resolved) {
       return res.status(404).json({ error: 'File not found' });
     }
@@ -241,101 +266,106 @@ export function createApp() {
     const contentType =
       isStreamRequest && streamContentTypeIsNeutral() ? 'application/octet-stream' : realType;
 
-    fsSync.stat(resolved, (err, stat) => {
-      if (err || !stat.isFile()) {
-        return res.status(404).json({ error: 'File not found' });
-      }
+    let stat: import('fs').Stats;
+    try {
+      stat = await fsSync.promises.stat(resolved);
+    } catch {
+      return res.status(404).json({ error: 'File not found' });
+    }
+    if (!stat.isFile()) {
+      return res.status(404).json({ error: 'File not found' });
+    }
 
-      // Offload the bytes to nginx. Express answers with a header only and the
-      // frontend nginx — which has the uploads directory mounted read-only —
-      // streams the file itself, so Node never copies a byte of audio. Range
-      // requests are answered by nginx too, which is what makes the double
-      // (whole-file and seek) streaming load disappear.
-      //
-      // Only audio takes this path: images need the extension-driven
-      // Content-Type, and the internal location maps audio extensions to their
-      // real type (a neutral octet-stream answer would stop iOS Safari from
-      // decoding the stream at all).
-      // Unset X_ACCEL_PREFIX to fall back to streaming through Node.
-      const accelPrefix = process.env.X_ACCEL_PREFIX;
-      if (isAudio && accelPrefix) {
-        return res
-          .status(200)
-          .set(
-            'X-Accel-Redirect',
-            `${accelPrefix.replace(/\/+$/, '')}/${type}/${encodeURIComponent(path.basename(resolved))}`
-          )
-          .end();
-      }
+    // Offload the bytes to nginx. Express answers with a header only and the
+    // frontend nginx — which has the uploads directory mounted read-only —
+    // streams the file itself, so Node never copies a byte of audio. Range
+    // requests are answered by nginx too, which is what makes the double
+    // (whole-file and seek) streaming load disappear.
+    //
+    // Only audio takes this path: images need the extension-driven
+    // Content-Type, and the internal location maps audio extensions to their
+    // real type (a neutral octet-stream answer would stop iOS Safari from
+    // decoding the stream at all).
+    // Unset X_ACCEL_PREFIX to fall back to streaming through Node.
+    const accelPrefix = process.env.X_ACCEL_PREFIX;
+    if (isAudio && accelPrefix) {
+      return res
+        .status(200)
+        .set(
+          'X-Accel-Redirect',
+          `${accelPrefix.replace(/\/+$/, '')}/${type}/${encodeURIComponent(path.basename(resolved))}`
+        )
+        .end();
+    }
 
-      const fileSize = stat.size;
-      const range = req.headers.range;
+    const fileSize = stat.size;
+    const range = req.headers.range;
 
-      if (!range) {
-        // Declaring Content-Length without piping the bytes leaves the client
-        // waiting for a body that never arrives, so the whole-file case has to
-        // stream too rather than just ending the response.
-        res.writeHead(200, {
-          'Content-Length': fileSize,
-          'Content-Type': contentType,
-          'Accept-Ranges': isAudio ? 'bytes' : 'none',
-          'Cache-Control': 'public, max-age=31536000',
-          ...INLINE_HEADERS,
-        });
-        const whole = fsSync.createReadStream(resolved);
-        whole.on('error', () => res.destroy());
-        return whole.pipe(res);
-      }
-
-      const unsatisfiable = () =>
-        res.status(416).set('Content-Range', `bytes */${fileSize}`).json({ error: 'Range not satisfiable' });
-
-      // Only a single explicit byte range is supported; multipart ranges are
-      // rejected rather than silently served as the whole file.
-      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
-      if (!match) return unsatisfiable();
-
-      // Two forms, per RFC 7233. `bytes=100-200` is absolute on both ends.
-      // `bytes=-500` has an empty start and means "the LAST 500 bytes", which
-      // is not the same as "bytes 0-500"; treating the suffix as an absolute
-      // end would serve the wrong bytes from the start of the file.
-      const hasStart = match[1] !== '';
-      const hasEnd = match[2] !== '';
-
-      if (!hasStart && !hasEnd) return unsatisfiable();
-
-      let start: number;
-      let end: number;
-
-      if (!hasStart) {
-        // Suffix range. Clamp a suffix longer than the file to the whole file.
-        const suffix = parseInt(match[2]!, 10);
-        if (Number.isNaN(suffix) || suffix < 0) return unsatisfiable();
-        start = Math.max(0, fileSize - suffix);
-        end = fileSize - 1;
-      } else {
-        start = parseInt(match[1]!, 10);
-        end = hasEnd ? parseInt(match[2]!, 10) : fileSize - 1;
-        if (Number.isNaN(end)) return unsatisfiable();
-        end = Math.min(end, fileSize - 1);
-      }
-
-      if (Number.isNaN(start) || start < 0 || end < start || start >= fileSize) {
-        return unsatisfiable();
-      }
-      const chunkSize = end - start + 1;
-      const file = fsSync.createReadStream(resolved, { start, end });
-      file.on('error', () => res.destroy());
-      res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': chunkSize,
+    if (!range) {
+      // Declaring Content-Length without piping the bytes leaves the client
+      // waiting for a body that never arrives, so the whole-file case has to
+      // stream too rather than just ending the response.
+      res.writeHead(200, {
+        'Content-Length': fileSize,
         'Content-Type': contentType,
+        'Accept-Ranges': isAudio ? 'bytes' : 'none',
         'Cache-Control': 'public, max-age=31536000',
         ...INLINE_HEADERS,
       });
-      file.pipe(res);
+      const whole = fsSync.createReadStream(resolved);
+      whole.on('error', () => res.destroy());
+      // Client aborts (seek, tab close) must release the descriptor instead of
+      // waiting for GC; a flood of aborted requests otherwise exhausts fds.
+      res.on('close', () => whole.destroy());
+      return whole.pipe(res);
+    }
+
+    const unsatisfiable = () =>
+      res.status(416).set('Content-Range', `bytes */${fileSize}`).json({ error: 'Range not satisfiable' });
+
+    // Only a single explicit byte range is supported; multipart ranges are
+    // rejected rather than silently served as the whole file.
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!match) return unsatisfiable();
+
+    // Two forms, per RFC 7233. `bytes=100-200` is absolute on both ends.
+    const hasStart = match[1] !== '';
+    const hasEnd = match[2] !== '';
+
+    if (!hasStart && !hasEnd) return unsatisfiable();
+
+    let start: number;
+    let end: number;
+
+    if (!hasStart) {
+      // Suffix range. Clamp a suffix longer than the file to the whole file.
+      const suffix = parseInt(match[2]!, 10);
+      if (Number.isNaN(suffix) || suffix < 0) return unsatisfiable();
+      start = Math.max(0, fileSize - suffix);
+      end = fileSize - 1;
+    } else {
+      start = parseInt(match[1]!, 10);
+      end = hasEnd ? parseInt(match[2]!, 10) : fileSize - 1;
+      if (Number.isNaN(end)) return unsatisfiable();
+      end = Math.min(end, fileSize - 1);
+    }
+
+    if (Number.isNaN(start) || start < 0 || end < start || start >= fileSize) {
+      return unsatisfiable();
+    }
+    const chunkSize = end - start + 1;
+    const file = fsSync.createReadStream(resolved, { start, end });
+    file.on('error', () => res.destroy());
+    res.on('close', () => file.destroy());
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunkSize,
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=31536000',
+      ...INLINE_HEADERS,
     });
+    file.pipe(res);
   });
 
   // Health routes
@@ -347,6 +377,9 @@ export function createApp() {
     });
   });
 
+  // Liveness stays dependency-free: the process is alive even while MySQL is
+  // briefly unreachable. Readiness is what the Docker healthcheck uses, so a
+  // broken database or cache actually shows up as an unhealthy container.
   app.get('/health', (_req, res) => {
     res.json({
       status: 'healthy',
@@ -354,6 +387,48 @@ export function createApp() {
       environment: process.env.NODE_ENV || 'development',
     });
   });
+
+  app.get('/health/ready', async (_req, res) => {
+    const checks = { database: 'ok', redis: redis ? 'ok' : 'disabled' };
+    let healthy = true;
+
+    try {
+      await queryOne('SELECT 1');
+    } catch {
+      checks.database = 'unavailable';
+      healthy = false;
+    }
+
+    if (redis) {
+      try {
+        await redis.ping();
+      } catch {
+        checks.redis = 'unavailable';
+        healthy = false;
+      }
+    }
+
+    res.status(healthy ? 200 : 503).json({
+      status: healthy ? 'ready' : 'not ready',
+      checks,
+      uptime: process.uptime(),
+      environment: process.env.NODE_ENV || 'development',
+    });
+  });
+
+  // Event-driven knowledge sync: successful content writes schedule a debounced
+  // refresh of the chatbot's searchable knowledge. The router below never
+  // blocks the response, and the periodic scheduler is a backup.
+  if (process.env.NODE_ENV !== 'test') {
+    app.use((req, res, next) => {
+      res.on('finish', () => {
+        if (res.statusCode >= 400) return;
+        const source = mapWritePathToSource(req.method, req.originalUrl);
+        if (source) scheduleContentSync(source.table, source.id);
+      });
+      next();
+    });
+  }
 
   console.log('Registering API routes...');
 
@@ -366,9 +441,8 @@ export function createApp() {
   app.use('/api/public', browseLimiter, publicRoutes);
   app.use('/api/analytics', analyticsRoutes);
   app.use('/api/contact', contactRoutes);
-  // The router applies chatLimiter itself; adding it here too would count every
-  // request twice and halve the intended limit.
-  app.use('/api/chat', chatRoutes);
+  app.use('/api/chatbot', chatbotRoutes);
+  app.use('/api/admin/chatbot', adminChatbotRoutes);
 
   console.log('API routes registered.');
 
@@ -419,6 +493,9 @@ export async function start() {
   try {
     await initDB();
     console.log('Database initialized.');
+    await invalidateChatbotCache();
+    void syncAllContent().catch((error) => console.error('[chatbot] initial content sync failed:', error));
+    startChatbotSyncScheduler();
 
     const { app, port } = createApp();
     const server = app.listen(port, () => {
@@ -435,6 +512,17 @@ export async function start() {
     };
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
+
+    // Without these, a stray rejection or thrown error kills the process with
+    // no record of why. Log first, then exit so the container restarts cleanly.
+    process.on('unhandledRejection', (reason) => {
+      console.error('[process] Unhandled promise rejection:', reason);
+      process.exit(1);
+    });
+    process.on('uncaughtException', (error) => {
+      console.error('[process] Uncaught exception:', error);
+      process.exit(1);
+    });
 
     return server;
   } catch (error) {

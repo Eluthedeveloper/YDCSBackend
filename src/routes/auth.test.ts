@@ -319,18 +319,23 @@ describe('PUT /api/auth/me', () => {
   });
 
   it('bumps token_version and re-issues the cookie on a password change', async () => {
+    mockQuery(async (sql: string) => {
+      if (/SELECT password FROM users WHERE id/.test(sql)) return { password: PLAIN_ADMIN.password };
+      return undefined;
+    });
     db.txSelect.mockResolvedValue({
       id: 'user-admin',
       username: 'admin',
       email: 'admin@audio.com',
       role: 'admin',
       token_version: 1,
+      password: PLAIN_ADMIN.password,
     });
 
     const res = await request(app)
       .put('/api/auth/me')
       .set('Cookie', cookieHeader(tokenFor(PLAIN_ADMIN)))
-      .send({ password: 'a-brand-new-password' });
+      .send({ password: 'a-brand-new-password', current_password: 'correct-horse' });
 
     expect(res.status).toBe(200);
 
@@ -341,12 +346,25 @@ describe('PUT /api/auth/me', () => {
     expect(cookies.some((c) => c.startsWith('ydcs_session='))).toBe(true);
   });
 
+  it('requires the current password to change the email', async () => {
+    const res = await request(app)
+      .put('/api/auth/me')
+      .set('Cookie', cookieHeader(tokenFor(PLAIN_ADMIN)))
+      .send({ email: 'new@audio.com' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/current password/i);
+  });
+
   it('does not bump token_version for a username-only change', async () => {
+    mockQuery(async (sql: string) =>
+      /SELECT password FROM users WHERE id/.test(sql) ? { password: PLAIN_ADMIN.password } : undefined
+    );
 
     const res = await request(app)
       .put('/api/auth/me')
       .set('Cookie', cookieHeader(tokenFor(PLAIN_ADMIN)))
-      .send({ username: 'admin2' });
+      .send({ username: 'admin2', current_password: 'correct-horse' });
 
     expect(res.status).toBe(200);
     const updateCall = db.runSQL.mock.calls.find((c) => /UPDATE users SET/.test(c[0] as string));
@@ -411,7 +429,7 @@ describe('DELETE /api/auth/:id', () => {
     // anyway, so the old code's UPDATE-then-DELETE could only half-succeed.
     mockQuery(async (sql: string) => {
       if (/COUNT\(\*\).*programs/s.test(sql)) return { programs: 3, tracks: 41 };
-      if (/SELECT id, username FROM users/.test(sql)) return { id: 'user-admin', username: 'admin' };
+      if (/SELECT id, username, role FROM users/.test(sql)) return { id: 'user-admin', username: 'admin' };
       return undefined;
     });
 
@@ -424,10 +442,27 @@ describe('DELETE /api/auth/:id', () => {
     expect(db.runSQL).not.toHaveBeenCalledWith('DELETE FROM users WHERE id = ?', expect.anything());
   });
 
+  it('refuses to delete the last super admin', async () => {
+    mockQuery(async (sql: string) => {
+      if (/SELECT id, username, role FROM users/.test(sql)) {
+        return { id: 'user-super2', username: 'root', role: 'super_admin' };
+      }
+      if (/COUNT\(\*\).*super_admin/.test(sql)) return { total: 1 };
+      return undefined;
+    });
+
+    const res = await request(app)
+      .delete('/api/auth/user-super2')
+      .set('Cookie', cookieHeader(tokenFor(SUPER_ADMIN)));
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/last super admin/i);
+  });
+
   it('deletes a user with no content', async () => {
     mockQuery(async (sql: string) => {
       if (/COUNT\(\*\).*programs/s.test(sql)) return { programs: 0, tracks: 0 };
-      if (/SELECT id, username FROM users/.test(sql)) return { id: 'user-admin', username: 'admin' };
+      if (/SELECT id, username, role FROM users/.test(sql)) return { id: 'user-admin', username: 'admin' };
       return undefined;
     });
 

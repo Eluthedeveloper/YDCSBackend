@@ -49,7 +49,8 @@ const MAX_BLOG_IMAGES = 6;
 // Bound on rows any list returns: enough for a homepage feed, small enough
 // that one request can never materialise an unbounded table.
 const MAX_ROWS = 100;
-const MAX_PHOTOS_PER_ALBUM = 500;// Album department slugs: a NULL department keeps the album on the general
+const MAX_PHOTOS_PER_ALBUM = 500;
+// Album department slugs: a NULL department keeps the album on the general
 // Gallery page, one of these mounts it on that department's page too. Frontend
 // department pages query by slug, so changing a value here breaks their feed —
 // they must be changed together.
@@ -335,12 +336,15 @@ async function withBlogImages(posts: BlogRow[]): Promise<Array<BlogRow & { image
  * Normalises the `keepImages` body field of an edit: a JSON array of the
  * gallery filenames the admin did not remove. Basenames only, so a crafted
  * value can never match a row by path trickery.
+ *
+ * Returns null for anything that is not a valid array. Treating malformed
+ * input as an empty array would silently drop every existing photo.
  */
-function parseKeepImages(raw: unknown): string[] {
-  const parsed: unknown = typeof raw === 'string' && raw.trim().startsWith('[')
+function parseKeepImages(raw: unknown): string[] | null {
+  const parsed: unknown = typeof raw === 'string'
     ? (() => { try { return JSON.parse(raw); } catch { return null; } })()
     : raw;
-  if (!Array.isArray(parsed)) return [];
+  if (!Array.isArray(parsed)) return null;
   return parsed
     .filter((value): value is string => typeof value === 'string' && value.length > 0)
     .map((value) => path.basename(value));
@@ -707,7 +711,7 @@ router.get('/whats-new', browseLimiter, asyncHandler(async (_req, res: Response)
       title: row.title,
       summary: summarize(row.body),
       image: null,
-      url: '/',
+      url: '/#announcements',
       published_at: row.created_at,
     })),
     ...events.map((row) => ({
@@ -716,7 +720,7 @@ router.get('/whats-new', browseLimiter, asyncHandler(async (_req, res: Response)
       title: row.title,
       summary: summarize(row.location ? `${row.location} — ${row.description ?? ''}` : row.description),
       image: null,
-      url: '/',
+      url: '/#events',
       published_at: row.created_at,
     })),
   ];
@@ -1310,9 +1314,16 @@ router.put('/blog/:id', authenticate, requireContentEditor, writeLimiter, upload
   );
   // A request without `keepImages` (an API client rather than the admin form)
   // leaves the gallery untouched; the form always lists what survives.
-  const keepNames = req.body?.keepImages === undefined
-    ? existing.map((row) => row.image)
-    : parseKeepImages(req.body.keepImages);
+  let keepNames: string[];
+  if (req.body?.keepImages === undefined) {
+    keepNames = existing.map((row) => row.image);
+  } else {
+    const parsed = parseKeepImages(req.body.keepImages);
+    if (parsed === null) {
+      return reject(400, 'keepImages must be a JSON array of filenames');
+    }
+    keepNames = parsed;
+  }
   const keptCount = existing.filter((row) => keepNames.includes(row.image)).length;
   if (keptCount + gallery.length > MAX_BLOG_IMAGES) {
     return reject(400, `A post can hold at most ${MAX_BLOG_IMAGES} photos`);

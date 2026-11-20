@@ -170,7 +170,7 @@ router.post('/', authenticate, requireAdmin, uploadLimiter, uploadCover.single('
       [id, cleanTitle, cleanDescription || null, cover_image, last?.next_order ?? 1, req.user!.id]);
 
     await cacheDelete(...programReadCacheKeys(id));
-    res.status(201).json({ id, title: cleanTitle, description, cover_image, created_by: req.user!.id });
+    res.status(201).json({ id, title: cleanTitle, description: cleanDescription || null, cover_image, created_by: req.user!.id });
   } catch (err) {
     removeCover(req.file?.filename);
     throw err;

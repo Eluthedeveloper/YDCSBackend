@@ -120,6 +120,7 @@ interface TrackRow {
   program_id: string;
   group_name: string | null;
   group_order: number;
+  created_by: string;
 }
 
 const UPLOADS_ROOT = path.resolve(process.cwd(), 'uploads');
@@ -850,6 +851,13 @@ router.put('/:id', authenticate, requireAdmin, writeLimiter, asyncHandler(async 
   const track = await queryOne<TrackRow>('SELECT * FROM tracks WHERE id = ?', [req.params.id]);
   if (!track) return res.status(404).json({ error: 'Track not found' });
 
+  // Same ownership rule as programs: an admin edits their own uploads, while a
+  // super admin can fix anyone's. Without this any admin could rewrite another
+  // admin's metadata.
+  if (req.user!.role !== 'super_admin' && track.created_by !== req.user!.id) {
+    return res.status(403).json({ error: 'You can only edit tracks you created' });
+  }
+
   const { title, artist, album, track_type, group_name } = req.body ?? {};
 
   if (title !== undefined && (typeof title !== 'string' || !title.trim())) {
@@ -857,6 +865,14 @@ router.put('/:id', authenticate, requireAdmin, writeLimiter, asyncHandler(async 
   }
   if (typeof title === 'string' && title.trim().length > MAX_TITLE) {
     return res.status(400).json({ error: `Title must be ${MAX_TITLE} characters or fewer` });
+  }
+  // mysql2 binds strings, not arbitrary JSON values. Reject arrays/objects here
+  // so a malformed body is a 400 rather than a driver error and a 500.
+  if (artist !== undefined && artist !== null && typeof artist !== 'string') {
+    return res.status(400).json({ error: 'Invalid artist' });
+  }
+  if (album !== undefined && album !== null && typeof album !== 'string') {
+    return res.status(400).json({ error: 'Invalid album' });
   }
   for (const [label, value, max] of [['Artist', artist, MAX_ARTIST], ['Album', album, MAX_ALBUM]] as const) {
     if (typeof value === 'string' && value.length > max) {

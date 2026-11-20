@@ -5,7 +5,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { queryAll, queryOne, runSQL, withTransaction, type SqlParam } from '../database/schema';
 import { AuthRequest, authenticate, requireSuperAdmin, ROLES } from '../middleware/auth';
 import { asyncHandler } from '../lib/asyncHandler';
-import { clearAuthCookie, setAuthCookie, TOKEN_TTL_SECONDS } from '../lib/authCookie';
+import { clearAuthCookie, readToken, setAuthCookie, TOKEN_TTL_SECONDS } from '../lib/authCookie';
 
 const router = Router();
 
@@ -66,7 +66,7 @@ function validateCredentials(username: unknown, email: unknown, password: unknow
 router.post('/login', asyncHandler(async (req, res: Response) => {
   const { username, password } = req.body ?? {};
 
-  if (!username || !password) {
+  if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
     return res.status(400).json({ error: 'Username and password are required' });
   }
 
@@ -85,10 +85,26 @@ router.post('/login', asyncHandler(async (req, res: Response) => {
   res.json({ user: publicUser(user) });
 }));
 
-router.post('/logout', (_req, res: Response) => {
+router.post('/logout', asyncHandler(async (req, res: Response) => {
+  // Clearing the cookie is not enough: a copied token stays valid for its full
+  // lifetime (and slides forward while it is used). Bump token_version so every
+  // issued token for this user is rejected from now on.
+  const token = readToken(req);
+  const secret = process.env.JWT_SECRET;
+  if (token && secret) {
+    try {
+      const decoded = jwt.verify(token, secret) as jwt.JwtPayload & { id?: unknown };
+      if (typeof decoded.id === 'string') {
+        await runSQL('UPDATE users SET token_version = token_version + 1 WHERE id = ?', [decoded.id]);
+      }
+    } catch {
+      // Expired or invalid token: there is no live session to revoke.
+    }
+  }
+
   clearAuthCookie(res);
   res.json({ message: 'Logged out' });
-});
+}));
 
 router.get('/me', authenticate, asyncHandler(async (req: AuthRequest, res: Response) => {
   const user = await queryOne(
@@ -144,6 +160,23 @@ router.put('/me', authenticate, asyncHandler(async (req: AuthRequest, res: Respo
     }
     updates.push('password = ?');
     values.push(await bcrypt.hash(password, BCRYPT_ROUNDS));
+  }
+
+  // A stolen session must not be enough to change the account's identity or
+  // lock the real owner out. Any of those changes requires the existing
+  // password, checked once for the whole update.
+  if (username !== undefined || email !== undefined || password !== undefined) {
+    const currentPassword = (req.body ?? {}).current_password;
+    if (typeof currentPassword !== 'string' || currentPassword.length === 0) {
+      return res.status(400).json({ error: 'Current password is required to update account details' });
+    }
+    const current = await queryOne<{ password: string }>(
+      'SELECT password FROM users WHERE id = ?',
+      [req.user!.id]
+    );
+    if (!current || !(await bcrypt.compare(currentPassword, current.password))) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
   }
 
   if (updates.length === 0) {
@@ -237,9 +270,23 @@ router.delete('/:id', authenticate, requireSuperAdmin, asyncHandler(async (req: 
     return res.status(400).json({ error: 'Cannot delete yourself' });
   }
 
-  const targetUser = await queryOne('SELECT id, username FROM users WHERE id = ?', [req.params.id]);
+  const targetUser = await queryOne<{ id: string; username: string; role: string }>(
+    'SELECT id, username, role FROM users WHERE id = ?',
+    [req.params.id]
+  );
   if (!targetUser) {
     return res.status(404).json({ error: 'User not found' });
+  }
+
+  // The last super admin is the only account that can manage users, so
+  // deleting it would lock everyone out of user management for good.
+  if (targetUser.role === 'super_admin') {
+    const superAdmins = await queryOne<{ total: number }>(
+      "SELECT COUNT(*) as total FROM users WHERE role = 'super_admin'"
+    );
+    if ((Number(superAdmins?.total) || 0) <= 1) {
+      return res.status(400).json({ error: 'Cannot delete the last super admin' });
+    }
   }
 
   // programs.created_by / tracks.created_by are NOT NULL with ON DELETE RESTRICT,
@@ -248,17 +295,30 @@ router.delete('/:id', authenticate, requireSuperAdmin, asyncHandler(async (req: 
   // content entirely, so the delete is refused until the content is gone.
   const owned = await queryOne(
     `SELECT
-       (SELECT COUNT(*) FROM programs WHERE created_by = ?) as programs,
-       (SELECT COUNT(*) FROM tracks   WHERE created_by = ?) as tracks`,
-    [req.params.id, req.params.id]
-  ) as { programs: number; tracks: number } | undefined;
+       (SELECT COUNT(*) FROM programs      WHERE created_by = ?) as programs,
+       (SELECT COUNT(*) FROM tracks        WHERE created_by = ?) as tracks,
+       (SELECT COUNT(*) FROM albums        WHERE created_by = ?) as albums,
+       (SELECT COUNT(*) FROM announcements WHERE created_by = ?) as announcements,
+       (SELECT COUNT(*) FROM events        WHERE created_by = ?) as events,
+       (SELECT COUNT(*) FROM blog_posts    WHERE created_by = ?) as blog_posts`,
+    [req.params.id, req.params.id, req.params.id, req.params.id, req.params.id, req.params.id]
+  ) as {
+    programs: number; tracks: number; albums: number;
+    announcements: number; events: number; blog_posts: number;
+  } | undefined;
 
-  if ((owned?.programs ?? 0) > 0 || (owned?.tracks ?? 0) > 0) {
+  const ownedCounts = owned
+    ? Object.fromEntries(Object.entries(owned).map(([key, value]) => [key, Number(value) || 0]))
+    : null;
+  const total = ownedCounts
+    ? Object.values(ownedCounts).reduce((sum, value) => sum + value, 0)
+    : 0;
+
+  if (total > 0) {
     return res.status(409).json({
       error: 'Cannot delete a user who still owns content',
-      detail: `Delete or reassign their ${owned!.programs} program(s) and ${owned!.tracks} track(s) first`,
-      programs: owned!.programs,
-      tracks: owned!.tracks,
+      detail: 'Delete or reassign their programs, tracks, albums, announcements, events and blog posts first',
+      owned: ownedCounts,
     });
   }
 

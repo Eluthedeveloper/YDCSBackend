@@ -57,14 +57,14 @@ export function authenticate(req: AuthRequest, res: Response, next: NextFunction
   }
 
   // Token revocation: reject tokens issued before the user's version was
-  // bumped (e.g. after a password change).
+  // bumped (e.g. after a password change or logout).
   return asyncHandler<AuthRequest>(async (req2, res2, next2) => {
-    const user = await queryOne(
+    const stored = await queryOne(
       'SELECT id, token_version FROM users WHERE id = ?',
       [decoded.id]
     ) as { id: string; token_version: number } | undefined;
 
-    if (!user || decoded.tokenVersion !== user.token_version) {
+    if (!stored || decoded.tokenVersion !== stored.token_version) {
       return res2.status(401).json({ error: 'Session revoked, please log in again' });
     }
 

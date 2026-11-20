@@ -55,7 +55,33 @@ const transporter = nodemailer.createTransport({
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   },
+  // Without explicit deadlines a blocked or unreachable SMTP host leaves
+  // sendMail pending for minutes, and the visitor's form spins on "Sending…"
+  // the whole time. Failing fast turns that into the route's normal 500 so the
+  // UI can show an actionable error instead of appearing frozen.
+  connectionTimeout: 10_000,
+  greetingTimeout: 10_000,
+  socketTimeout: 20_000,
 });
+
+// nodemailer's own timeouts cover the socket, but they do not bound a send that
+// is stuck before a socket is assigned (a DNS or TLS stall). This deadline is
+// the last line of defence: the route always answers within a predictable time.
+function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms} ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
 
 // Escape basic HTML to avoid markup injection from user input
 function escapeHtml(str: string): string {
@@ -193,19 +219,23 @@ router.post('/', contactLimiter, asyncHandler(async (req, res: Response) => {
         <p style="margin:0; font-size:15px; color:#3a3d45; line-height:1.6;">${safeMessage}</p>
       </div>`;
 
-    await transporter.sendMail({
-      from: `"${process.env.SMTP_FROM_NAME || 'YDCS Radio'}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
-      to: process.env.CONTACT_RECEIVER || process.env.SMTP_USER,
-      replyTo: headerSafe(email),
-      subject: `[Contact Form] ${headerSafe(subject)}`,
-      html: emailShell({
-        headerTitle: 'New Contact Form Message',
-        headerSubtitle: 'Someone reached out through the YDCS Radio website',
-        bodyHtml: adminBody,
-        footerText: 'Sent from the YDCS Radio contact form.',
+    await withDeadline(
+      transporter.sendMail({
+        from: `"${process.env.SMTP_FROM_NAME || 'YDCS Radio'}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
+        to: process.env.CONTACT_RECEIVER || process.env.SMTP_USER,
+        replyTo: headerSafe(email),
+        subject: `[Contact Form] ${headerSafe(subject)}`,
+        html: emailShell({
+          headerTitle: 'New Contact Form Message',
+          headerSubtitle: 'Someone reached out through the YDCS Radio website',
+          bodyHtml: adminBody,
+          footerText: 'Sent from the YDCS Radio contact form.',
+        }),
+        attachments: logoAttachments(),
       }),
-      attachments: logoAttachments(),
-    });
+      15_000,
+      'Admin notification email'
+    );
 
     // --- Confirmation email translations ---
     const confirmEmail: Record<
@@ -259,18 +289,22 @@ router.post('/', contactLimiter, asyncHandler(async (req, res: Response) => {
         </a>
       </div>`;
     try {
-      await transporter.sendMail({
-        from: `"${process.env.SMTP_FROM_NAME || 'YDCS Radio'}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
-        to: email,
-        subject: c.subject,
-        html: emailShell({
-          headerTitle: c.greeting,
-          headerSubtitle: c.subtitle,
-          bodyHtml: userBody,
-          footerText: `${c.footer} · ${CONTACT_PHONE}`,
+      await withDeadline(
+        transporter.sendMail({
+          from: `"${process.env.SMTP_FROM_NAME || 'YDCS Radio'}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
+          to: email,
+          subject: c.subject,
+          html: emailShell({
+            headerTitle: c.greeting,
+            headerSubtitle: c.subtitle,
+            bodyHtml: userBody,
+            footerText: `${c.footer} · ${CONTACT_PHONE}`,
+          }),
+          attachments: logoAttachments(),
         }),
-        attachments: logoAttachments(),
-      });
+        5_000,
+        'Confirmation email'
+      );
     } catch (confirmError) {
       console.error('[contact] Confirmation email failed (admin copy was delivered):', confirmError);
     }

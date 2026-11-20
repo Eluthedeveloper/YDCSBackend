@@ -28,8 +28,6 @@ placeholders. Never commit the filled-in file. One `.env` serves both
 | `JWT_SECRET` | 48 random bytes hex. Rotating it invalidates every session |
 | `REDIS_ENABLED` | `false` runs without Redis; otherwise rate limiting and caching need it |
 | `SMTP_*`, `CONTACT_*` | Contact form delivery; use a Gmail App Password |
-| `GEMINI_API_KEY` | Visitor chatbot. Server-side only; never expose it to the browser |
-| `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS` | Optional model overrides for the chatbot |
 | `UPLOAD_CHUNK_BYTES` | Bytes per audio upload chunk. Default 512 KB, which fits under nginx's stock 1 MB body cap. Raise it only when the front proxy allows larger bodies |
 | `STREAM_CONTENT_TYPE` | Content-Type for the extensionless `.stream` audio URLs. `audio` (default) declares the real audio type — required, because iOS Safari will not decode a media element whose response is not typed as audio. `neutral` restores the old `application/octet-stream` answer |
 | `NODE_ENV` | `production` marks session cookies `secure` |
@@ -44,29 +42,36 @@ on the same origin, which keeps the session cookie first-party.
 
 ## Visitor chatbot
 
-`POST /api/chat` powers the floating assistant on the public site. The browser
-posts `{ messages: [{ role, text }], lang }` and receives `{ reply }`; the API
-key and the organisation prompt never leave the server.
+The floating assistant on the public site uses the local database, not an
+external model. There is no API key, no paid service and no prompt to maintain
+in source code.
 
-- The facts the assistant may use are in `src/lib/orgKnowledge.ts`. Update that
-  file when public details (address, staff, services, bookshops) change.
-- The assistant can also read live public content through the read-only tools in
-  `src/lib/chatDatabase.ts`: programmes, tracks, **published** blog articles,
-  announcements, events, leaders, photo albums and public counts. Each query is
-  written out in full, uses bound `?` parameters, is limited to a handful of
-  rows, and maps only public columns. The tools deliberately cannot reach
-  `users`, passwords, emails, comments, likes or listening history.
-- A reply may use up to two tool rounds, with a 45-second deadline for the whole
-  exchange so a slow model does not leave the visitor waiting indefinitely.
-- The route trims history to the last 12 turns, caps messages at 1500
-  characters, and applies `chatLimiter` (40 messages per 15 minutes per IP).
-- `GEMINI_MODEL` is tried first; if it fails for any reason (overload, timeout,
-  empty response or a bad request), `GEMINI_FALLBACK_MODELS` are tried in
-  order. A quota or rate-limit rejection (HTTP 429) stops immediately and
-  returns 429, because every model shares the same API key. A safety block is
-  answered calmly instead of being retried on another model.
-- Responses are sent with `Cache-Control: no-store` because each conversation
-  is specific to one visitor.
+- `POST /api/chatbot/message` accepts `{ sessionId, message, lang }` and returns
+  the answer plus match metadata. Conversations and every message are stored in
+  `chatbot_conversations` / `chatbot_messages` for admin review.
+- Answers come from `chatbot_knowledge`, seeded with 11 intents and English,
+  Amharic and Afaan Oromo entries by migration `022_seed_chatbot_defaults`.
+  Admins edit these in `/admin/player/chatbot`; no React file contains answers.
+- Matching combines exact/phrase overlap, keyword overlap and Fuse.js fuzzy
+  search, with a small boost for the current intent during follow-ups. The
+  confidence threshold, fuzzy threshold, languages, welcome/fallback messages,
+  sync interval and approval mode are all editable in the admin UI and cached
+  in Redis when available.
+- `GET /api/chatbot/suggestions?lang=en` serves the highest-priority approved
+  questions so the widget never hardcodes suggestions.
+- Published announcements, events, blog articles, programmes, tracks, albums,
+  leaders and radio-schedule rows are synced into `chatbot_knowledge` by
+  `src/lib/chatbotSync.ts`. A successful content write schedules a debounced
+  refresh; a 10-minute scheduler is the backup; `POST /api/admin/chatbot/sync/run`
+  triggers it manually. Synced entries carry `source_table`, `source_id` and a
+  content hash so edits update in place and deletions remove stale answers.
+- By default synced content is approved automatically. Turn off
+  `auto_approve_content` in the admin settings to require review; pending
+  entries are hidden from visitors until approved.
+- All chatbot caches are invalidated when knowledge, settings or synced content
+  changes. The public message route caps input at 1500 characters and applies
+  `chatLimiter` (40 messages per 15 minutes per IP). Responses are
+  `no-store` because each conversation is specific to one visitor.
 
 ## Schema
 

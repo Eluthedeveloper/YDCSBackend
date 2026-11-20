@@ -34,7 +34,7 @@ services:
     # both this server and the backend client (REDIS_PASSWORD below) enforce
     # AUTH. Redis is not port-mapped, so the docker network is the only wall
     # today; setting REDIS_PASSWORD adds a second one.
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-}"]
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-}", "--maxmemory", "${REDIS_MAXMEMORY:-256mb}", "--maxmemory-policy", "allkeys-lru"]
     environment:
       # Exposed to the healthcheck below so it can AUTH when a password is set.
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
@@ -88,10 +88,6 @@ services:
       SMTP_FROM_NAME: ${SMTP_FROM_NAME:-YDCS Radio}
       CONTACT_RECEIVER: ${CONTACT_RECEIVER:-}
       CONTACT_PHONE: ${CONTACT_PHONE:-}
-      # Visitor chat. The key is only ever read here, never by the frontend.
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
-      GEMINI_FALLBACK_MODELS: ${GEMINI_FALLBACK_MODELS:-gemini-3.5-flash,gemini-3.8-flash}
       # Audio is handed to nginx via X-Accel-Redirect (the frontend container
       # has ./uploads mounted read-only at /srv/uploads), so Node never copies
       # streamed bytes. Unset this to fall back to streaming through Node.
@@ -110,7 +106,9 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:7000/health"]
+      # Readiness, not liveness: this checks MySQL and Redis too, so the
+      # container is marked unhealthy when its dependencies are down.
+      test: ["CMD", "wget", "-qO-", "http://localhost:7000/health/ready"]
       interval: 15s
       timeout: 5s
       retries: 5
