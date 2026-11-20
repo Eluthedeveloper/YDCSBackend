@@ -122,6 +122,19 @@ describe('admin chatbot routes', () => {
     expect(res.body.totals.unanswered).toBe(2);
   });
 
+  it('returns settings in the snake_case shape the admin form expects', async () => {
+    const res = await request(app).get('/api/admin/chatbot/settings');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      confidence_threshold: 0.38,
+      enabled_languages: ['en', 'am', 'om'],
+      welcome_messages: { en: 'Hi' },
+      sync_interval_minutes: 10,
+    });
+    expect(res.body.enabledLanguages).toBeUndefined();
+  });
+
   it('updates settings with validated values', async () => {
     const res = await request(app)
       .put('/api/admin/chatbot/settings')

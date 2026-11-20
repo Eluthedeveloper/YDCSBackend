@@ -313,6 +313,17 @@ describe('POST /api/site/events', () => {
     expect(insert?.[1]).toContain('2026-11-02 18:30:00');
   });
 
+  it('stores a date-only start as an all-day event at midnight', async () => {
+    const res = await request(app)
+      .post('/api/site/events')
+      .set('Cookie', cookieFor('admin'))
+      .send({ title: 'Conference', starts_at: '2026-11-16' });
+
+    expect(res.status).toBe(201);
+    const insert = db.runSQL.mock.calls.find((c) => /INSERT INTO events/.test(c[0] as string));
+    expect(insert?.[1]).toContain('2026-11-16 00:00:00');
+  });
+
   it('rejects an unparseable start date instead of storing garbage', async () => {
     const res = await request(app)
       .post('/api/site/events')

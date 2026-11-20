@@ -9,12 +9,27 @@ import {
   Lang,
   loadSettings,
   SETTINGS_CACHE_KEY,
+  type ChatbotSettings,
 } from '../lib/chatbot';
 import { getSyncStatus, syncAllContent, syncContentSource, SyncedTable, SYNCED_TABLES } from '../lib/chatbotSync';
 import { cacheSet } from '../cache/redis';
 
 const router = Router();
 router.use(authenticate, requireAdmin);
+
+/** The admin UI speaks snake_case; the shared chatbot library uses camelCase. */
+function toWireSettings(settings: ChatbotSettings) {
+  return {
+    confidence_threshold: settings.confidenceThreshold,
+    fuzzy_threshold: settings.fuzzyThreshold,
+    welcome_messages: settings.welcomeMessages,
+    fallback_messages: settings.fallbackMessages,
+    enabled_languages: settings.enabledLanguages,
+    auto_approve_content: settings.autoApproveContent,
+    sync_interval_minutes: settings.syncIntervalMinutes,
+    max_history_turns: settings.maxHistoryTurns,
+  };
+}
 
 const MAX_LIST = 200;
 const bool = (value: unknown, fallback: boolean): boolean => {
@@ -241,7 +256,7 @@ router.get('/conversations/:id', asyncHandler(async (req, res) => {
 }));
 
 router.get('/settings', asyncHandler(async (_req, res) => {
-  res.json(await loadSettings());
+  res.json(toWireSettings(await loadSettings()));
 }));
 
 router.put('/settings', asyncHandler(async (req, res) => {
@@ -288,7 +303,7 @@ router.put('/settings', asyncHandler(async (req, res) => {
   }
   await invalidateChatbotCache();
   await cacheSet(SETTINGS_CACHE_KEY, await loadSettings());
-  res.json(await loadSettings());
+  res.json(toWireSettings(await loadSettings()));
 }));
 
 router.get('/sync/status', asyncHandler(async (_req, res) => {

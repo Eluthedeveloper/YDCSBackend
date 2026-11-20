@@ -228,19 +228,18 @@ function removeUpload(dir: string, filename?: string | null) {
 }
 
 /**
- * Normalises the `datetime-local` value an admin form sends into a MySQL
+ * Normalises a date or `datetime-local` value from an admin form into a MySQL
  * DATETIME literal, or null when it is not a parseable date-time.
  *
- * The form sends `YYYY-MM-DDTHH:MM`; the space form is also accepted so a
- * hand-written API call works. Seconds are appended because MySQL's DATETIME
- * accepts them and the column renders them anyway.
+ * A date-only value (`YYYY-MM-DD`) is an all-day event and is stored at
+ * midnight; the UIs omit the time when they see 00:00:00.
  */
 function coerceDateTime(value: unknown): string | null {
   const raw = singleString(value);
   if (!raw) return null;
-  const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(?::\d{2})?$/.exec(raw);
+  const match = /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2})(?::\d{2})?)?$/.exec(raw);
   if (!match) return null;
-  const normalized = `${match[1]} ${match[2]}:00`;
+  const normalized = `${match[1]} ${match[2] ?? '00:00'}:00`;
   return Number.isNaN(Date.parse(normalized.replace(' ', 'T'))) ? null : normalized;
 }
 
@@ -1118,10 +1117,10 @@ router.post('/events', authenticate, requireContentEditor, writeLimiter, asyncHa
   }
 
   const start = coerceDateTime(starts_at);
-  if (!start) return res.status(400).json({ error: 'A valid start date and time is required' });
+  if (!start) return res.status(400).json({ error: 'A valid start date is required' });
   const end = ends_at !== undefined && singleString(ends_at) ? coerceDateTime(ends_at) : null;
   if (ends_at !== undefined && singleString(ends_at) && !end) {
-    return res.status(400).json({ error: 'Invalid end date and time' });
+    return res.status(400).json({ error: 'Invalid end date' });
   }
   if (end && end < start) {
     return res.status(400).json({ error: 'End must be after start' });
@@ -1163,13 +1162,13 @@ router.put('/events/:id', authenticate, requireContentEditor, writeLimiter, asyn
   }
 
   const start = starts_at !== undefined ? coerceDateTime(starts_at) : event.starts_at;
-  if (!start) return res.status(400).json({ error: 'Invalid start date and time' });
+  if (!start) return res.status(400).json({ error: 'Invalid start date' });
 
   let end: string | null;
   if (ends_at !== undefined) {
     end = singleString(ends_at) ? coerceDateTime(ends_at) : null;
     if (singleString(ends_at) && !end) {
-      return res.status(400).json({ error: 'Invalid end date and time' });
+      return res.status(400).json({ error: 'Invalid end date' });
     }
   } else {
     end = event.ends_at;
