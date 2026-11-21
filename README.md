@@ -30,6 +30,14 @@ placeholders. Never commit the filled-in file. One `.env` serves both
 | `SMTP_*`, `CONTACT_*` | Contact form delivery; use a Gmail App Password |
 | `UPLOAD_CHUNK_BYTES` | Bytes per audio upload chunk. Default 512 KB, which fits under nginx's stock 1 MB body cap. Raise it only when the front proxy allows larger bodies |
 | `STREAM_CONTENT_TYPE` | Content-Type for the extensionless `.stream` audio URLs. `audio` (default) declares the real audio type — required, because iOS Safari will not decode a media element whose response is not typed as audio. `neutral` restores the old `application/octet-stream` answer |
+| `FFMPEG_PATH` | ffmpeg binary used to package HLS. Defaults to `ffmpeg` on `PATH`; the Docker image installs it. Without it the player falls back to progressive streaming |
+| `HLS_SEGMENT_SECONDS`, `HLS_AUDIO_BITRATE`, `HLS_MAX_CONCURRENCY`, `HLS_FFMPEG_TIMEOUT_MS` | Tuning for the HLS packager. Defaults: 6 s segments, 128 kbps AAC, 2 concurrent transcodes, 5 minute timeout |
+
+New uploads are packaged in the background after the row is created; tracks
+uploaded before HLS was enabled are packaged on their first play. Cached
+packages live under `uploads/hls/<stem>/`. With `X_ACCEL_PREFIX` set, nginx
+serves the segments (the playlist stays on Node because it must be generated
+and revalidated).
 | `NODE_ENV` | `production` marks session cookies `secure` |
 
 The CORS allowlist in `src/index.ts` is an explicit origin list, not an

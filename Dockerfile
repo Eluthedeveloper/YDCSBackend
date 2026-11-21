@@ -40,7 +40,11 @@ COPY --from=build /app/asset ./asset
 # process (uid 1000) owns them. The bind mount in docker-compose.yml overrides
 # this with the host directory, so that one needs to be writable by uid 1000 as
 # well.
-RUN mkdir -p /app/uploads/tracks /app/uploads/covers /app/uploads/leaders /app/uploads/albums /app/uploads/tmp && chown -R node:node /app/uploads
+# ffmpeg builds the on-demand HLS playlists. It is installed in the runtime
+# image only; the player falls back to progressive streaming when it is absent.
+RUN apk add --no-cache ffmpeg \
+ && mkdir -p /app/uploads/tracks /app/uploads/covers /app/uploads/leaders /app/uploads/albums /app/uploads/tmp /app/uploads/hls \
+ && chown -R node:node /app/uploads
 
 USER node
 

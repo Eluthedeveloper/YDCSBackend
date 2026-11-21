@@ -12,6 +12,7 @@ const asBuffer = (res: request.Response) =>
 const UPLOADS_ROOT = path.resolve(process.cwd(), 'uploads');
 const AUDIO_DIR = path.join(UPLOADS_ROOT, 'tracks');
 const COVER_DIR = path.join(UPLOADS_ROOT, 'covers');
+const HLS_DIR = path.join(UPLOADS_ROOT, 'hls');
 
 const NAMES: string[] = [];
 
@@ -32,10 +33,14 @@ beforeAll(() => {
   writeFixture(AUDIO_DIR, 'vitest-audio.mp3', 'A'.repeat(1000));
   writeFixture(AUDIO_DIR, 'vitest-positioned.mp3', POSITIONED);
   writeFixture(COVER_DIR, 'vitest-cover.png', 'B'.repeat(500));
+  // A pre-built HLS package, so the serving path can be tested without ffmpeg.
+  writeFixture(path.join(HLS_DIR, 'vitest-audio'), 'index.m3u8', '#EXTM3U\n#EXT-X-TARGETDURATION:6\nseg00000.ts\n');
+  writeFixture(path.join(HLS_DIR, 'vitest-audio'), 'seg00000.ts', 'SEGMENT');
 });
 
 afterAll(() => {
   for (const f of NAMES) fs.rmSync(f, { force: true });
+  fs.rmSync(path.join(HLS_DIR, 'vitest-audio'), { recursive: true, force: true });
 });
 
 describe('GET /api/uploads/:type/:filename', () => {
@@ -294,6 +299,80 @@ describe('GET /api/uploads/:type/:filename', () => {
     const res = await request(app).get(`/api/uploads/tracks/${filename}`);
     expect([403, 404]).toContain(res.status);
     expect(res.text).not.toMatch(/MYSQL_ROOT_PASSWORD|"name": "audiostreaming-backend"/);
+  });
+});
+
+describe('GET /api/uploads/hls/:stem/:file', () => {
+  const { app } = createApp();
+
+  it('serves a cached playlist with the HLS media type', async () => {
+    const res = await request(app).get('/api/uploads/hls/vitest-audio/index.m3u8');
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('application/vnd.apple.mpegurl');
+    expect(res.text).toContain('#EXTM3U');
+  });
+
+  it('serves segments with the MPEG-TS media type', async () => {
+    const res = await request(app)
+      .get('/api/uploads/hls/vitest-audio/seg00000.ts')
+      .buffer(true)
+      .parse((r, cb) => {
+        const chunks: Buffer[] = [];
+        r.on('data', (c: Buffer) => chunks.push(c));
+        r.on('end', () => cb(null, Buffer.concat(chunks)));
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('video/mp2t');
+    expect(asBuffer(res)).toBe('SEGMENT');
+  });
+
+  // Segments are the bulk of the bytes; nginx reads them from the read-only
+  // uploads mount so Node never copies them.
+  it('hands HLS segments to nginx via X-Accel-Redirect when the prefix is set', async () => {
+    process.env.X_ACCEL_PREFIX = '/__media';
+    try {
+      const segment = await request(app).get('/api/uploads/hls/vitest-audio/seg00000.ts');
+      expect(segment.status).toBe(200);
+      expect(segment.headers['x-accel-redirect']).toBe('/__media/hls/vitest-audio/seg00000.ts');
+      expect(segment.text ?? '').toBe('');
+
+      // The playlist stays on Node: it must be generated and revalidated.
+      const playlist = await request(app).get('/api/uploads/hls/vitest-audio/index.m3u8');
+      expect(playlist.status).toBe(200);
+      expect(playlist.headers['x-accel-redirect']).toBeUndefined();
+      expect(playlist.text).toContain('#EXTM3U');
+    } finally {
+      delete process.env.X_ACCEL_PREFIX;
+    }
+  });
+
+  // The player treats this as "no HLS here" and falls back to the progressive
+  // stream, so a host without ffmpeg still plays the whole catalogue.
+  it('reports 503 when ffmpeg is missing', async () => {
+    const previous = process.env.FFMPEG_PATH;
+    process.env.FFMPEG_PATH = path.join(UPLOADS_ROOT, 'definitely-no-ffmpeg');
+    try {
+      const res = await request(app).get('/api/uploads/hls/vitest-positioned/index.m3u8');
+      expect(res.status).toBe(503);
+    } finally {
+      if (previous === undefined) delete process.env.FFMPEG_PATH;
+      else process.env.FFMPEG_PATH = previous;
+    }
+  });
+
+  it.each([
+    ['..%2F..%2Fpackage.json', 'encoded parent traversal'],
+    ['%2e%2e', 'encoded dot-dot'],
+  ])('refuses %s (%s)', async (stem) => {
+    const res = await request(app).get(`/api/uploads/hls/${stem}/index.m3u8`);
+    expect([403, 404]).toContain(res.status);
+  });
+
+  it('returns 404 for a segment that was never generated', async () => {
+    const res = await request(app).get('/api/uploads/hls/vitest-audio/seg99999.ts');
+    expect(res.status).toBe(404);
   });
 });
 

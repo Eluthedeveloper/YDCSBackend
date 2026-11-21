@@ -20,6 +20,7 @@ import chatbotRoutes from './routes/chatbot';
 import adminChatbotRoutes from './routes/adminChatbot';
 import { invalidateChatbotCache } from './lib/chatbot';
 import { mapWritePathToSource, scheduleContentSync, startChatbotSyncScheduler, syncAllContent } from './lib/chatbotSync';
+import { ensureHlsPlaylist, HlsUnavailableError, HLS_ROOT, isSafeHlsStem, resolveTrackSource } from './lib/hls';
 
 import { generalLimiter, browseLimiter, authLimiter, mediaLimiter } from './middleware/rateLimit';
 
@@ -36,6 +37,8 @@ const MIME_TYPES: Record<string, string> = {
   '.flac': 'audio/flac', '.m4a': 'audio/mp4', '.aac': 'audio/aac',
   '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
   '.webp': 'image/webp', '.gif': 'image/gif',
+  '.m3u8': 'application/vnd.apple.mpegurl', '.ts': 'video/mp2t',
+  '.m4s': 'video/iso.segment', '.mp4': 'video/mp4',
 };
 
 // Tells download managers (IDM and friends) that these files are meant for
@@ -229,6 +232,75 @@ export function createApp() {
   });
 
   console.log('Uploads directory:', UPLOADS_ROOT);
+
+  // HLS playlists and segments. Kept separate from the generic uploads route
+  // because the stem is a directory component, and because requesting the
+  // playlist is what triggers packaging of a track that has never been played
+  // through HLS before.
+  app.get('/api/uploads/hls/:stem/:file', async (req, res) => {
+    const { stem } = req.params;
+    const requested = req.params.file;
+    const file = path.basename(requested);
+    if (!isSafeHlsStem(stem) || file !== requested || !/^[A-Za-z0-9._-]+$/.test(file)) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    const typeRoot = path.resolve(HLS_ROOT, stem);
+    const filePath = path.resolve(typeRoot, file);
+    if (path.dirname(filePath) !== typeRoot) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    if (file.toLowerCase().endsWith('.m3u8')) {
+      const source = await resolveTrackSource(stem);
+      if (!source) return res.status(404).json({ error: 'File not found' });
+      try {
+        await ensureHlsPlaylist(source, stem);
+      } catch (error) {
+        // The player treats 503 as "no HLS here" and uses the progressive
+        // stream instead, so a server without ffmpeg still plays the catalogue.
+        if (error instanceof HlsUnavailableError) {
+          console.error('[hls]', error.message);
+          return res.status(503).json({ error: 'HLS transcoding is not available' });
+        }
+        console.error('[hls] generation failed:', error);
+        return res.status(500).json({ error: 'Could not prepare HLS stream' });
+      }
+    }
+
+    let stat: import('fs').Stats;
+    try {
+      stat = await fsSync.promises.stat(filePath);
+    } catch {
+      return res.status(404).json({ error: 'File not found' });
+    }
+    if (!stat.isFile()) return res.status(404).json({ error: 'File not found' });
+
+    const ext = path.extname(file).toLowerCase();
+    const isPlaylist = ext === '.m3u8';
+
+    // Segments are immutable and can be large in aggregate, so nginx serves
+    // them straight from the read-only uploads mount. The playlist stays on
+    // Node because it must be generated and revalidated, and because it is
+    // tiny.
+    const accelPrefix = process.env.X_ACCEL_PREFIX;
+    if (!isPlaylist && accelPrefix) {
+      return res
+        .status(200)
+        .set(
+          'X-Accel-Redirect',
+          `${accelPrefix.replace(/\/+$/, '')}/hls/${encodeURIComponent(stem)}/${encodeURIComponent(file)}`
+        )
+        .end();
+    }
+
+    res.set('Content-Type', MIME_TYPES[ext] || 'application/octet-stream');
+    res.set('Content-Disposition', 'inline');
+    // Segments are immutable (their names change on regeneration); the
+    // playlist must be revalidated so a regenerated track is picked up.
+    res.set('Cache-Control', isPlaylist ? 'no-cache' : 'public, max-age=31536000, immutable');
+    return res.sendFile(filePath);
+  });
 
   app.get('/api/uploads/:type/:filename', async (req, res) => {
     const { type, filename } = req.params;

@@ -14,6 +14,7 @@ import { singleString, coerceDuration, MAX_ALBUM, MAX_ARTIST, MAX_GROUP, MAX_TIT
 import { readAudioTags, resolveTrackMeta } from '../lib/audioTags';
 import type { TrackMeta } from '../lib/audioTags';
 import { asyncHandler } from '../lib/asyncHandler';
+import { ensureHlsPlaylist, removeHlsPackage } from '../lib/hls';
 
 const router = Router();
 
@@ -126,6 +127,22 @@ interface TrackRow {
 const UPLOADS_ROOT = path.resolve(process.cwd(), 'uploads');
 const TMP_ROOT = path.join(UPLOADS_ROOT, 'tmp');
 const TRACKS_ROOT = path.join(UPLOADS_ROOT, 'tracks');
+
+/**
+ * Packages a freshly uploaded track for HLS in the background.
+ *
+ * Doing it here rather than on first play moves the ffmpeg cost to upload
+ * time, so the first listener starts instantly. The upload response does not
+ * wait for it; a failure only logs, and playback still has the progressive
+ * `.stream` fallback.
+ */
+function queueHlsPackage(filename: string): void {
+  if (process.env.NODE_ENV === 'test') return;
+  const name = path.basename(filename);
+  void ensureHlsPlaylist(path.join(TRACKS_ROOT, name), path.parse(name).name).catch((error) => {
+    console.warn(`[hls] packaging ${name} failed:`, error);
+  });
+}
 
 // Fixed chunk size the client must use. The client always takes this value
 // from the init response, so the two sides can never disagree.
@@ -389,6 +406,7 @@ router.post('/', authenticate, requireAdmin, uploadLimiter, uploadTrack.single('
   }
 
   await cacheDelete(...programReadCacheKeys(cleanProgramId));
+  queueHlsPackage(req.file.filename);
   res.status(201).json({ id, title: meta.title, artist: meta.artist, album: meta.album, file_path: req.file.filename, program_id: cleanProgramId, track_type: cleanTrackType, sort_order: sortOrder, group_name: group.groupName, group_order: group.groupOrder });
 }));
 
@@ -488,6 +506,7 @@ router.post('/bulk', authenticate, requireAdmin, uploadLimiter, uploadTrack.arra
     }
 
     await cacheDelete(...programReadCacheKeys(program_id));
+    for (const track of uploaded) queueHlsPackage(track.file_path);
     res.status(201).json({ uploaded: uploaded.length, tracks: uploaded });
   } catch (err) {
     // Any error thrown after cleanupFiles already ran is a no-op unlink.
@@ -707,6 +726,7 @@ router.post('/upload/finalize', authenticate, requireAdmin, uploadLimiter, async
 
   await removeTmpUpload(uploadId);
   await cacheDelete(...programReadCacheKeys(cleanProgramId));
+  queueHlsPackage(filename);
   res.status(201).json({
     id,
     title: resolved.title,
@@ -985,7 +1005,9 @@ router.delete('/', authenticate, requireSuperAdmin, writeLimiter, asyncHandler(a
 
   for (const row of rows) {
     if (row.file_path) {
-      fs.unlink(path.join(UPLOADS_ROOT, 'tracks', path.basename(row.file_path))).catch(() => {});
+      const name = path.basename(row.file_path);
+      fs.unlink(path.join(UPLOADS_ROOT, 'tracks', name)).catch(() => {});
+      void removeHlsPackage(path.parse(name).name);
     }
   }
 
@@ -1010,7 +1032,9 @@ router.delete('/:id', authenticate, requireSuperAdmin, writeLimiter, asyncHandle
   if (track.file_path) {
     // basename() as defence in depth: file_path is server-generated, but the
     // unlink runs against the filesystem and should never be steerable by it.
-    fs.unlink(path.join(UPLOADS_ROOT, 'tracks', path.basename(track.file_path))).catch(() => {});
+    const name = path.basename(track.file_path);
+    fs.unlink(path.join(UPLOADS_ROOT, 'tracks', name)).catch(() => {});
+    void removeHlsPackage(path.parse(name).name);
   }
 
   res.json({ message: 'Track deleted' });
