@@ -28,10 +28,7 @@ dotenv.config();
 
 const UPLOADS_ROOT = path.resolve(process.cwd(), 'uploads');
 // Upload directories the /api/uploads route will serve. Each entry is one
-// subdirectory of ./uploads; the filenames are UUIDs, so the type segment is
-// the only part of the URL that carries meaning.
 const UPLOAD_TYPES = ['tracks', 'covers', 'leaders', 'albums', 'blogs'] as const;
-
 const MIME_TYPES: Record<string, string> = {
   '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
   '.flac': 'audio/flac', '.m4a': 'audio/mp4', '.aac': 'audio/aac',
@@ -49,12 +46,6 @@ const INLINE_HEADERS = { 'Content-Disposition': 'inline' } as const;
 // INLINE_HEADERS alone is not enough. IDM first looks at the extension in the
 // URL, and when that is unrecognisable it falls back to the response
 // Content-Type — that is how a bare `.ts` module URL got saved as `metadata.JS`.
-//
-// Audio is therefore streamed from an extensionless `<uuid>.stream` URL, which
-// leaves IDM no extension to build a download task around. The response still
-// declares the real audio type, because a media element that is not typed as
-// audio is refused outright by iOS Safari. The file on disk keeps its real
-// extension, so the stem is resolved back to it against the list below.
 const STREAM_SUFFIX = '.stream';
 
 const AUDIO_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac'];
@@ -169,10 +160,6 @@ export function createApp() {
   // The API only ever returns JSON, so its CSP is a hard deny: no scripts, no
   // styles, no frames. The policy that governs the actual pages is set by
   // nginx, which is what serves the HTML.
-  //
-  // COEP/CORP stay off: audio is fetched cross-origin by the player and the
-  // cover images are read from other origins, so cross-origin isolation would
-  // break playback rather than protect it.
   app.use(
     helmet({
       contentSecurityPolicy: {
@@ -353,7 +340,6 @@ export function createApp() {
     // streams the file itself, so Node never copies a byte of audio. Range
     // requests are answered by nginx too, which is what makes the double
     // (whole-file and seek) streaming load disappear.
-    //
     // Only audio takes this path: images need the extension-driven
     // Content-Type, and the internal location maps audio extensions to their
     // real type (a neutral octet-stream answer would stop iOS Safari from
